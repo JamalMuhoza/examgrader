@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Exam Grader</title>
-  <meta name="description" content="Offline paper exam grading: print exams with bubbles, scan with the camera, grade, and export marked PDFs and gradebooks.">
+  <meta name="description" content="Offline paper exam grading: print exams with bubbles, upload a filled key, scan students, grade automatically (AI for written answers), approve, and get marked PDFs and gradebooks.">
   <meta name="theme-color" content="#00553a">
   <link rel="manifest" href="manifest.webmanifest">
   <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
@@ -17,12 +17,14 @@
     <select id="examPick" aria-label="Current exam"></select>
   </header>
   <nav id="nav" aria-label="Sections"></nav>
+  <div id="aiq" class="aiq hidden" role="status" aria-live="polite"></div>
   <main id="view"></main>
   <div id="toasts"></div>
 
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js" crossorigin="anonymous"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js" crossorigin="anonymous"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js" crossorigin="anonymous"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js" crossorigin="anonymous"></script>
   <script src="js/util.js"></script>
   <script src="js/db.js"></script>
   <script src="js/layout.js"></script>

@@ -1,5 +1,5 @@
 /* Exam Grader service worker: offline cache for the app shell and the CDN libraries */
-const VERSION = 'examgrader-v2';
+const VERSION = 'examgrader-v3';
 const SHELL = [
   './', './index.html', './style.css', './manifest.webmanifest',
   './js/util.js', './js/db.js', './js/layout.js', './js/cv.js', './js/annot.js', './js/grade.js', './js/export.js', './js/ai.js', './js/app.js',
@@ -9,7 +9,8 @@ const CDN = [
   'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js',
   'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js',
   'https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js',
-  'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js'
+  'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js',
+  'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js'
 ];
 
 self.addEventListener('install', ev => {
