@@ -10,11 +10,11 @@
     autoApprove: false
   };
   const VIEWS = [
-    ['exams', 'Exams'], ['template', 'Exam template'], ['setup', 'Setup'], ['print', 'Print'], ['scan', 'Scan'], ['review', 'Review'],
-    ['grade', 'Grade'], ['results', 'Results'], ['settings', 'Settings'], ['help', 'Help']
+    ['exams', 'Exams'], ['template', 'Create'], ['print', 'Print'], ['scan', 'Scan'], ['review', 'Review'],
+    ['grade', 'Grade'], ['results', 'Results'], ['settings', 'Settings']
   ];
 
-  const SUBVIEWS = { make: 'template', import: 'template' };   // screens reached from Exam template (its menu item stays lit)
+  const SUBVIEWS = { make: 'template', import: 'template', setup: 'template', help: 'template' };   // screens reached from Exam template (its menu item stays lit)
 
   // ---------------- boot ----------------
   async function boot() {
@@ -379,7 +379,7 @@
   // ---------------- Exam template: download a Word template, make an exam here, or upload an existing exam ----------------
   function aiImportOn() { return aiOn(); }
   function viewTemplate(v) {
-    v.appendChild(el('h2', {}, 'Exam template'));
+    v.appendChild(el('h2', {}, 'Create'));
     v.appendChild(el('p', { class: 'muted' }, 'Start here. Fill the Word template, type the exam in the app, or convert an exam you already have; either way the app prints the bubble exam that it scans and grades.'));
     const st = S.settings;
     const status = el('div', { class: 'small', id: 'impStatus', role: 'status', 'aria-live': 'polite' });
