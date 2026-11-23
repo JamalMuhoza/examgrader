@@ -1120,7 +1120,7 @@
     fill();
     const tools = el('div', { class: 'row wrap tools', id: 'inkTools' },
       ['pen', 'check', 'cross'].map(t => el('button', { class: 'btn toolbtn' + (GS.tool === t ? ' primary' : ''), 'data-tool': t, onclick: ev => { GS.tool = t; $$('.toolbtn').forEach(b => b.classList.toggle('primary', b.dataset.tool === t)); } }, { pen: 'Pen', check: 'Check stamp', cross: 'Cross stamp' }[t])));
-    v.appendChild(el('div', { class: 'card row wrap stickybar' }, field('Mode', modeSel), field(GS.mode === 'question' ? 'Question' : 'Student', pick), tools, GS.mode === 'student' ? el('button', { class: 'btn', id: 'btnGradeStuPdf', onclick: () => exportStudent(studs[GS.stu || 0]) }, "Download this student's PDF") : null, el('span', { id: 'saveState', class: 'muted small' }, 'Autosave on')));
+    v.appendChild(el('div', { class: 'card row wrap stickybar' }, field('Mode', modeSel), field(GS.mode === 'question' ? 'Question' : 'Student', pick), tools, el('span', { id: 'saveState', class: 'muted small' }, 'Autosave on')));
     const aiBox = el('div', { id: 'aiBox' }); v.appendChild(aiBox);
     const list = el('div', { id: 'gradeList' }); v.appendChild(list);
     modeSel.onchange = () => { GS.mode = modeSel.value; go('grade'); };
@@ -1475,7 +1475,7 @@
     const ex = el('div', { class: 'card' }, el('h3', {}, 'Export now (any status)'),
       el('div', { class: 'row wrap' },
         el('button', { class: 'btn', id: 'btnCombined', onclick: () => exportCombined(sortedGraded()) }, 'Combined class PDF'),
-        el('button', { class: 'btn', id: 'btnAllPdfs', onclick: () => exportAll(sortedGraded()) }, 'All student PDFs (one file each)'),
+        el('button', { class: 'btn', id: 'btnAllPdfs', onclick: () => exportAll(sortedGraded()) }, 'All student PDFs'),
         el('button', { class: 'btn', id: 'btnCsv', onclick: () => exportCSV(sortedGraded()) }, 'CSV gradebook'),
         el('button', { class: 'btn', id: 'btnXlsx', onclick: () => exportXLSX(sortedGraded()) }, 'Excel gradebook'),
         el('button', { class: 'btn', id: 'btnCloud', onclick: () => cloudSave(sortedGraded()) }, 'Save to Google Drive')),
@@ -1546,7 +1546,7 @@
           el('td', {}, el('div', { class: 'row tight' },
             el('button', { class: 'btn small', onclick: () => preview(x.stu) }, 'View'),
             e.sa.length ? el('button', { class: 'btn small', onclick: () => { GS.mode = 'student'; GS.stu = studs.indexOf(x.stu); go('grade'); } }, 'Open') : null,
-            el('button', { class: 'btn small', title: "Download this student's marked PDF", onclick: () => exportStudent(x.stu) }, 'Download PDF'),
+            el('button', { class: 'btn small', onclick: () => exportStudent(x.stu) }, 'PDF'),
             g.approved ? el('button', { class: 'btn small btnreopen', title: 'Set back to Draft (not auto-approved again)', onclick: async () => { markDraft(x.stu); x.stu.held = true; await saveStudent(x.stu); renderDash(); } }, 'Reopen')
               : el('button', { class: 'btn small primary btnapprove', onclick: () => approveStudents([x.stu]) }, 'Approve'))));
       })));
@@ -1700,14 +1700,7 @@
         } }, 'Download all (ZIP)'),
         out.classPdf ? el('button', { class: 'btn small', id: 'dlClass', onclick: () => U.download(out.classPdf.blob, out.classPdf.name) }, 'Class PDF') : null,
         out.xlsx ? el('button', { class: 'btn small', id: 'dlXlsx', onclick: () => U.download(out.xlsx.blob, out.xlsx.name) }, 'Excel') : null,
-        out.csv ? el('button', { class: 'btn small', id: 'dlCsv', onclick: () => U.download(out.csv.blob, out.csv.name) }, 'CSV') : null),
-      (() => {
-        const list = Object.values(out.students).filter(s => s && s.blob).sort((a, b) => String(a.name).localeCompare(String(b.name)));
-        if (!list.length) return null;
-        const sel = el('select', { id: 'dlOneSel' }, list.map((s, i) => el('option', { value: i }, String(s.name).replace(/\.pdf$/i, ''))));
-        return el('div', { class: 'row wrap', id: 'dlOne' }, el('label', {}, 'One student: ', sel),
-          el('button', { class: 'btn small', id: 'dlOneBtn', onclick: () => { const s = list[+sel.value]; U.download(s.blob, s.name); } }, "Download this student's PDF"));
-      })()));
+        out.csv ? el('button', { class: 'btn small', id: 'dlCsv', onclick: () => U.download(out.csv.blob, out.csv.name) }, 'CSV') : null)));
   }
   function stat(k, val) { return el('div', { class: 'stat' }, el('div', { class: 'k' }, k), el('div', { class: 'v' }, String(val))); }
 
@@ -1739,7 +1732,7 @@
         sel.onchange = async () => { if (sel.value) stu.mcOverride[q.id] = sel.value; else delete stu.mcOverride[q.id]; markDraft(stu); await saveStudent(stu); preview(stu); refreshDash(); };
         return el('label', { class: 'ovr ' + r.state }, `${i + 1}. key ${q.answer || '?'} `, sel);
       })));
-    box.appendChild(el('div', { class: 'card' }, el('div', { class: 'row between' }, el('h3', {}, `Preview: ${g.id} ${g.name} - ${U.fmt(g.total)}/${U.fmt(g.max)} (${U.fmt(g.pct)}%)`), el('div', { class: 'row tight' }, el('button', { class: 'btn small primary', id: 'btnPreviewPdf', onclick: () => exportStudent(stu) }, "Download this student's PDF"), el('button', { class: 'btn small', onclick: () => { box.innerHTML = ''; } }, 'Close'))),
+    box.appendChild(el('div', { class: 'card' }, el('div', { class: 'row between' }, el('h3', {}, `Preview: ${g.id} ${g.name} - ${U.fmt(g.total)}/${U.fmt(g.max)} (${U.fmt(g.pct)}%)`), el('button', { class: 'btn small', onclick: () => { box.innerHTML = ''; } }, 'Close')),
       el('div', { class: 'previewpages', id: 'previewPages' }, pages.map((c, i) => { c.className = 'pv'; c.dataset.page = i + 1; return c; }))));
     box.appendChild(ovr);
     box.scrollIntoView({ behavior: 'smooth' });
