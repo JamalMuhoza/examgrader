@@ -133,6 +133,12 @@ input[type=checkbox] { width: auto; }
 .chip.on { background: #fbe9e7; border-color: #d98a84; color: var(--bad); }
 .note { width: 100%; margin-bottom: 6px; }
 .label { margin-top: 6px; }
+.gradeitem.aipending { border-color: #e9a9af; }
+.aipanel { border: 1px dashed #e26b76; background: #fff7f7; border-radius: 8px; padding: 8px 10px; margin: 6px 0 8px; display: flex; flex-direction: column; gap: 6px; }
+.rubriclist { margin: 0; padding-left: 20px; }
+.badge.mid { background: var(--warn-bg); color: var(--warn); }
+.aibar progress { width: 160px; max-width: 100%; height: 14px; }
+.ainote p { margin: 6px 0; }
 @media (min-width: 721px) { .stickybar { position: sticky; top: 98px; z-index: 10; box-shadow: 0 2px 8px rgba(0,0,0,.06); } }
 
 /* results */
