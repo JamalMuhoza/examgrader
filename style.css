@@ -206,7 +206,12 @@ input[type=checkbox] { width: auto; }
 .tplcard { display: flex; flex-direction: column; gap: 6px; margin-bottom: 0; }
 .tplcard p { margin: 0 0 6px; }
 .tplcard .btn { align-self: flex-start; }
-#impStatus { overflow-wrap: anywhere; }
+#impStatus, #tplStatus { overflow-wrap: anywhere; }
+.tplopts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin: 2px 0 4px; }
+.tplfield { display: flex; flex-direction: column; gap: 3px; font-size: 13px; min-width: 0; }
+.tplfield.wide { grid-column: 1 / -1; }
+.tplfield input, .tplfield select { width: 100%; min-width: 0; box-sizing: border-box; }
+#tplPrintNote { border-top: 1px solid var(--line); padding-top: 8px; margin-top: 4px; }
 .makebar { display: flex; flex-direction: column; gap: 8px; }
 .nomargin { margin: 0; }
 .makegrid { display: grid; grid-template-columns: minmax(0, 1fr) 250px; gap: 14px; align-items: start; }
