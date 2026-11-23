@@ -17,6 +17,7 @@
   async function boot() {
     S.settings = Object.assign({}, DEFAULT_SETTINGS, await DB.getKV('settings', {}));
     S.settings.omr = Object.assign({}, CV.DEFAULT_TH, S.settings.omr || {});
+    S.settings.ai = Object.assign({}, AI.DEFAULTS, S.settings.ai || {});
     S.exams = (await DB.all('exams')).sort((a, b) => (b.updated || 0) - (a.updated || 0));
     const last = await DB.getKV('currentExam', null);
     if (last && S.exams.find(e => e.id === last)) await selectExam(last, false);
@@ -53,6 +54,7 @@
 
   function go(view) {
     if (S.cam && view !== 'scan') stopCamera();
+    if (AIR.running) AIR.stop = true;
     S.view = view;
     history.replaceState(null, '', '#' + view);
     $$('.navbtn').forEach(b => b.classList.toggle('active', b.dataset.view === view));
@@ -206,7 +208,7 @@
     const renderSA = () => {
       saBox.innerHTML = '';
       saBox.appendChild(el('div', { class: 'row between' }, el('h3', {}, `Written response (${e.sa.length})`),
-        el('button', { class: 'btn', id: 'btnAddSA', onclick: () => { e.sa.push({ id: uid('s_'), prompt: '', max: 5, lines: 6, comments: [], key: '' }); saveSoon(); renderSA(); } }, 'Add written question')));
+        el('button', { class: 'btn', id: 'btnAddSA', onclick: () => { e.sa.push({ id: uid('s_'), prompt: '', max: 5, lines: 6, comments: [], key: '', modelAnswer: '', rubric: '' }); saveSoon(); renderSA(); } }, 'Add written question')));
       e.sa.forEach((q, i) => {
         saBox.appendChild(el('div', { class: 'qrow' },
           el('div', { class: 'qnum' }, 'SA' + (i + 1)),
@@ -216,7 +218,10 @@
               field('Max points', inp(q, 'max', { type: 'number', min: 0, step: 0.5, class: 'sa-max narrow' })),
               field('Box height (lines)', inp(q, 'lines', { type: 'number', min: 1, max: 28, class: 'sa-lines narrow' })),
               field('Preset comments (comma separated)', (() => { const t = el('input', { class: 'sa-comments' }); t.value = (q.comments || []).join(', '); t.oninput = () => { q.comments = t.value.split(',').map(s => s.trim()).filter(Boolean); saveSoon(); }; return t; })()),
-              field('Answer key note (key PDF only)', inp(q, 'key', { class: 'sa-key' })))),
+              field('Answer key note (key PDF only)', inp(q, 'key', { class: 'sa-key' }))),
+            el('div', { class: 'grid2' },
+              field('Answer key / model answer', inp(q, 'modelAnswer', { multiline: true, rows: 3, class: 'sa-model', placeholder: 'What a full-credit answer contains' }), 'Used by AI suggestions'),
+              field('Rubric', inp(q, 'rubric', { multiline: true, rows: 3, class: 'sa-rubric', placeholder: '2 pts correct product; 1 pt balanced; 1 pt units' }), 'Points per element, one per line or separated by ;'))),
           el('div', { class: 'qtools' },
             el('button', { class: 'btn small', title: 'Move up', onclick: () => { if (i) { [e.sa[i - 1], e.sa[i]] = [e.sa[i], e.sa[i - 1]]; saveSoon(); renderSA(); } } }, 'Up'),
             el('button', { class: 'btn small danger', onclick: () => { if (confirm('Remove this question?')) { e.sa.splice(i, 1); saveSoon(); renderSA(); } } }, 'Remove'))));
@@ -766,13 +771,16 @@
     const tools = el('div', { class: 'row wrap tools', id: 'inkTools' },
       ['pen', 'check', 'cross'].map(t => el('button', { class: 'btn toolbtn' + (GS.tool === t ? ' primary' : ''), 'data-tool': t, onclick: ev => { GS.tool = t; $$('.toolbtn').forEach(b => b.classList.toggle('primary', b.dataset.tool === t)); } }, { pen: 'Pen', check: 'Check stamp', cross: 'Cross stamp' }[t])));
     v.appendChild(el('div', { class: 'card row wrap stickybar' }, field('Mode', modeSel), field(GS.mode === 'question' ? 'Question' : 'Student', pick), tools, el('span', { id: 'saveState', class: 'muted small' }, 'Autosave on')));
+    const aiBox = el('div', { id: 'aiBox' }); v.appendChild(aiBox);
     const list = el('div', { id: 'gradeList' }); v.appendChild(list);
-    modeSel.onchange = () => { GS.mode = modeSel.value; go('grade'); };
-    pick.onchange = () => { if (GS.mode === 'question') GS.q = +pick.value; else GS.stu = +pick.value; renderList(); };
+    modeSel.onchange = () => { if (AIR.running) AIR.stop = true; GS.mode = modeSel.value; go('grade'); };
+    pick.onchange = () => { if (AIR.running) AIR.stop = true; if (GS.mode === 'question') GS.q = +pick.value; else GS.stu = +pick.value; renderList(); };
     let token = 0;
     const renderList = async () => {
       const my = ++token;
       list.innerHTML = '';
+      aiBox.innerHTML = '';
+      if (GS.mode === 'question' && S.settings.ai.enabled) aiBox.appendChild(aiBar(e.sa[GS.q], studs, list));
       const pairs = GS.mode === 'question' ? studs.map(s => [s, e.sa[GS.q]]) : e.sa.map(q => [studs[GS.stu], q]);
       for (const [stu, q] of pairs) {
         const item = await gradeItem(stu, q, studs);
@@ -783,7 +791,7 @@
     await renderList();
   }
 
-  async function gradeItem(stu, q, studs) {
+  async function gradeItem(stu, q, studs, opts = {}) {
     const e = S.exam, lay = L();
     const lq = lay.sa.find(s => s.qid === q.id);
     const qi = e.sa.indexOf(q);
@@ -799,11 +807,14 @@
     card.appendChild(cv);
     stu.sa = stu.sa || {}; stu.ink = stu.ink || {};
     const sa = stu.sa[q.id] = stu.sa[q.id] || { pts: null, comments: [], note: '' };
+    const pend = stu.aiPending && stu.aiPending[q.id];
+    if (pend) card.classList.add('aipending');
     const redraw = async () => {
       const full = CV.canvasOf(Layout.RW, Layout.RH);
       const g = gradeOf(stu);
       await Annot.renderPage(im, e, lay, g, stu, lq.page, { canvas: full });
       cv.getContext('2d').drawImage(full, R.x * PX, R.y * PX, cv.width, cv.height, 0, 0, cv.width, cv.height);
+      if (stu.aiPending && stu.aiPending[q.id]) AI.drawPending(cv.getContext('2d'), stu.aiPending[q.id].marks, lq, R.x * PX, R.y * PX);
       card.querySelector('.ptsnow').textContent = sa.pts === null || sa.pts === undefined ? 'not graded' : `${U.fmt(sa.pts)} / ${U.fmt(q.max)}`;
     };
     const save = async () => { await saveStudent(stu); markSaved(); await redraw(); };
@@ -862,6 +873,8 @@
     const inkTools = el('div', { class: 'row wrap' },
       el('button', { class: 'btn small', onclick: async () => { const ink = stu.ink[lq.page] || []; for (let i = ink.length - 1; i >= 0; i--) if (ink[i].q === q.id) { ink.splice(i, 1); break; } await save(); } }, 'Undo ink'),
       el('button', { class: 'btn small', onclick: async () => { if (!confirm('Clear all ink on this answer?')) return; stu.ink[lq.page] = (stu.ink[lq.page] || []).filter(k => k.q !== q.id); await save(); } }, 'Clear ink'));
+    if (pend) card.appendChild(pendingPanel(stu, q, pend, card, studs));
+    if (opts.edited) card.appendChild(el('p', { class: 'small muted aieditnote' }, 'AI suggestion applied. Adjust the points, comments or ink below.'));
     card.appendChild(el('div', { class: 'label small muted' }, 'Points'));
     card.appendChild(ptsRow);
     card.appendChild(chips);
@@ -869,6 +882,155 @@
     card.appendChild(inkTools);
     await redraw();
     return card;
+  }
+
+  // ---------------- AI suggestions (Gemini through the Apps Script server) ----------------
+  const AIR = { running: false, stop: false };
+  function aiReady() { const st = S.settings; return !!(st.cloudUrl && st.cloudToken); }
+  function presetsOf(q) { return Array.from(new Set([...(q.comments || []), ...(S.exam.comments || [])])); }
+  function saPage(stu, q) { const lq = L().sa.find(s => s.qid === q.id); return { lq, scan: lq ? gradeOf(stu).pages[lq.page] : null }; }
+  async function rerenderCard(stu, q, studs, opts = {}) {
+    const old = document.querySelector(`.gradeitem[data-stu="${stu.id}"][data-sa="${S.exam.sa.indexOf(q) + 1}"]`);
+    if (!old) return null;
+    const n = await gradeItem(stu, q, studs, opts);
+    old.replaceWith(n);
+    return n;
+  }
+
+  function pendingPanel(stu, q, p, card, studs) {
+    const flags = [];
+    if (!p.legible) flags.push(el('span', { class: 'badge bad' }, 'Illegible or blank'));
+    if (p.confidence !== 'high') flags.push(el('span', { class: 'badge ' + (p.confidence === 'low' ? 'bad' : 'mid') }, p.confidence + ' confidence'));
+    else flags.push(el('span', { class: 'badge' }, 'high confidence'));
+    return el('div', { class: 'aipanel', 'data-conf': p.confidence },
+      el('div', { class: 'row wrap' }, el('strong', {}, `AI suggestion: ${U.fmt(p.points)} / ${U.fmt(q.max)}`), flags, el('span', { class: 'muted small' }, 'Pending, not counted until accepted')),
+      (p.rubricItems || []).length ? el('ul', { class: 'rubriclist small' }, p.rubricItems.map(r => el('li', {}, `${r.item}: ${U.fmt(r.earned)} / ${U.fmt(r.max)}`))) : null,
+      p.comment ? el('div', { class: 'small' }, 'Comment: ', el('em', {}, p.comment)) : null,
+      el('div', { class: 'row wrap' },
+        el('button', { class: 'btn small primary aiaccept', onclick: () => applySuggestion(stu, q, studs, 'accepted') }, 'Accept'),
+        el('button', { class: 'btn small aiedit', onclick: () => applySuggestion(stu, q, studs, 'edited') }, 'Edit'),
+        el('button', { class: 'btn small danger aireject', onclick: async () => { delete stu.aiPending[q.id]; await saveStudent(stu); await rerenderCard(stu, q, studs); } }, 'Reject')));
+  }
+
+  // Accept: points + comment + marks become normal teacher annotations. Edit: the same, then the teacher adjusts.
+  async function applySuggestion(stu, q, studs, mode, rerender = true) {
+    const p = stu.aiPending && stu.aiPending[q.id]; if (!p) return;
+    const { lq } = saPage(stu, q);
+    stu.sa = stu.sa || {}; stu.ink = stu.ink || {};
+    const sa = stu.sa[q.id] = stu.sa[q.id] || { pts: null, comments: [], note: '' };
+    sa.pts = Math.max(0, Math.min(+q.max || 0, Math.round((+p.points || 0) * 2) / 2));
+    const c = String(p.comment || '').trim();
+    if (c) {
+      if (presetsOf(q).includes(c)) { if (!sa.comments.includes(c)) sa.comments = [...sa.comments, c]; }
+      else sa.note = sa.note ? sa.note + '; ' + c : c;
+    }
+    const ink = stu.ink[lq.page] = stu.ink[lq.page] || [];
+    ink.push(...AI.toInk(p.marks, lq, q.id));
+    sa.ai = mode; sa.aiModel = p.model || '';
+    delete stu.aiPending[q.id];
+    await saveStudent(stu);
+    if (!rerender) return;
+    const n = await rerenderCard(stu, q, studs, { edited: mode === 'edited' });
+    if (n && mode === 'edited') { n.scrollIntoView({ block: 'center' }); const ni = n.querySelector('input.note'); if (ni) ni.focus(); }
+  }
+
+  function aiBar(q, studs, list) {
+    const st = S.settings, ai = st.ai;
+    const box = el('div', { class: 'card aibar', id: 'aiBar' });
+    if (!aiReady()) { box.appendChild(el('p', { class: 'small' }, 'AI suggestions need the Apps Script URL and token in Settings > Google Drive / Sheets.')); return box; }
+    const prog = el('progress', { id: 'aiProg', max: 1, value: 0 });
+    const msg = el('span', { id: 'aiMsg', class: 'small' }, `Model: ${AI.modelOf(ai) || 'automatic'}. Up to ${ai.rpm} requests per minute.`);
+    const btnRun = el('button', { class: 'btn primary', id: 'btnAiSuggest' }, 'Suggest grades (AI)');
+    const btnStop = el('button', { class: 'btn danger', id: 'btnAiStop', disabled: true, onclick: () => { AIR.stop = true; msg.textContent = 'Stopping after the current answer...'; } }, 'Stop');
+    const btnAll = el('button', { class: 'btn', id: 'btnAiAcceptHigh', onclick: async () => {
+      let n = 0;
+      for (const stu of studs) { const p = stu.aiPending && stu.aiPending[q.id]; if (p && p.confidence === 'high' && p.legible) { await applySuggestion(stu, q, studs, 'accepted', false); n++; } }
+      for (const stu of studs) await rerenderCard(stu, q, studs);
+      toast(`${n} high-confidence suggestion(s) accepted`, 'good');
+    } }, 'Accept all high-confidence');
+    btnRun.onclick = () => runSuggest(q, studs, { prog, msg, btnRun, btnStop }).catch(err => { msg.textContent = 'Error: ' + err.message; });
+    box.appendChild(el('div', { class: 'row wrap' }, btnRun, btnStop, btnAll, prog, msg));
+    box.appendChild(el('p', { class: 'small muted' }, 'Only the cropped answer box is sent (no name or ID). Suggestions are pending until you accept them.'));
+    return box;
+  }
+
+  async function runSuggest(q, studs, ui) {
+    if (AIR.running) return;
+    const st = S.settings, ai = st.ai;
+    const { prog, msg, btnRun, btnStop } = ui;
+    const setMsg = t => { msg.textContent = t; };
+    if (!ai.models.length && !ai.model) {
+      setMsg('Loading models...');
+      const r = await AI.post(st.cloudUrl, st.cloudToken, { action: 'aiModels' });
+      if (!r.ok) { setMsg('Could not load models: ' + r.error); return; }
+      ai.models = r.models; await saveSettings();
+    }
+    const model = AI.modelOf(ai);
+    if (!model) { setMsg('No Gemini model available.'); return; }
+    // teacher-graded examples of this question (teacher's own grades first), up to 4
+    const graded = studs.filter(s => s.sa && s.sa[q.id] && s.sa[q.id].pts !== null && s.sa[q.id].pts !== undefined && saPage(s, q).scan)
+      .sort((a, b) => (!!a.sa[q.id].ai - !!b.sa[q.id].ai));
+    const examples = [];
+    for (const s of graded.slice(0, 4)) {
+      const { lq, scan } = saPage(s, q);
+      const g = s.sa[q.id];
+      examples.push({ imageB64: AI.boxCrop(await imgOf(scan), lq).b64, points: g.pts, comment: [...(g.comments || []), g.note || ''].map(t => String(t).trim()).filter(Boolean).join('; ') });
+    }
+    const todo = studs.filter(s => { const g = s.sa && s.sa[q.id]; return (!g || g.pts === null || g.pts === undefined) && !(s.aiPending && s.aiPending[q.id]) && saPage(s, q).scan; });
+    if (!todo.length) { setMsg('No ungraded answers left for this question.'); return; }
+    AIR.running = true; AIR.stop = false;
+    btnRun.disabled = true; btnStop.disabled = false;
+    prog.max = todo.length; prog.value = 0;
+    const cap = Math.max(1, +ai.dailyCap || AI.DEFAULTS.dailyCap);
+    let done = 0, errors = 0, warned = false, why = '';
+    const retries = new Map();
+    try {
+      for (let i = 0; i < todo.length; i++) {
+        if (AIR.stop) { why = 'Stopped.'; break; }
+        const stu = todo[i];
+        const used = await AI.today();
+        if (used >= cap) { why = `Daily limit reached (${used} of ${cap} requests today). Stopped; continue tomorrow or raise the limit in Settings.`; break; }
+        if (used >= cap - AI.WARN_MARGIN && !warned) { warned = true; toast(`AI requests today: ${used} of ${cap}. Close to the daily limit.`, 'bad'); }
+        const go_ = await AI.pace(ai.rpm, () => AIR.stop, w => setMsg(`Answer ${i + 1} of ${todo.length}: waiting ${Math.ceil(w / 1000)} s (pacing)`));
+        if (!go_) { why = 'Stopped.'; break; }
+        setMsg(`Answer ${i + 1} of ${todo.length}: asking ${model}...`);
+        const { lq, scan } = saPage(stu, q);
+        const crop = AI.boxCrop(await imgOf(scan), lq);
+        await AI.bump();
+        let r;
+        try {
+          r = await AI.post(st.cloudUrl, st.cloudToken, {
+            action: 'aiGrade', model, prompt: q.prompt || '', maxPoints: +q.max || 0, answerKey: q.modelAnswer || q.key || '', rubric: q.rubric || '',
+            presetComments: presetsOf(q), examples, imageB64: crop.b64
+          });
+        } catch (err) { r = { ok: false, error: 'Network error: ' + err.message }; }
+        if (!r.ok && r.rateLimited) {
+          if (r.dailyQuota) { why = 'Google reports the daily free quota is used up. Stopped; try again tomorrow.'; break; }
+          retries.set(stu.id, (retries.get(stu.id) || 0) + 1);
+          if (retries.get(stu.id) > 4) { why = 'Still rate limited after several pauses. Stopped.'; break; }
+          const secs = Math.min(120, Math.max(2, +r.retryAfter || 30));
+          const until = Date.now() + secs * 1000;
+          while (Date.now() < until && !AIR.stop) { setMsg(`Rate limited by Google. Paused, resuming in ${Math.ceil((until - Date.now()) / 1000)} s`); await U.sleep(250); }
+          AI.resetPace();
+          i--; continue;
+        }
+        if (!r.ok) {
+          errors++;
+          setMsg(`Answer ${i + 1}: ${r.error}`);
+          if (errors >= 3) { why = 'Stopped after 3 errors: ' + r.error; break; }
+          continue;
+        }
+        stu.aiPending = stu.aiPending || {};
+        stu.aiPending[q.id] = { ...r.result, model, at: Date.now() };
+        await saveStudent(stu);
+        await rerenderCard(stu, q, studs);
+        done++; prog.value = done;
+      }
+    } finally {
+      AIR.running = false; AIR.stop = false;
+      btnRun.disabled = false; btnStop.disabled = true;
+    }
+    setMsg(`${done} suggestion(s) ready${errors ? `, ${errors} error(s)` : ''}. ${why} Requests today: ${await AI.today()} of ${cap}.`.replace(/\s+/g, ' ').trim());
   }
 
   // ---------------- Results / preview / export ----------------
@@ -1042,6 +1204,7 @@
         try { const r = await Export.cloudPost(st.cloudUrl, st.cloudToken, { action: 'ping' }); cloudMsg.textContent = 'Connected: ' + (r.message || 'ok'); }
         catch (err) { cloudMsg.textContent = 'Failed: ' + err.message; }
       } }, 'Test connection'), cloudMsg)));
+    v.appendChild(await aiSettingsCard());
     const est = await DB.estimate();
     v.appendChild(el('div', { class: 'card' }, el('h3', {}, 'Data and backup'),
       el('p', { class: 'small muted' }, est ? `Storage used: ${(est.usage / 1048576).toFixed(1)} MB of ${(est.quota / 1048576).toFixed(0)} MB available to this site.` : 'Storage estimate unavailable.'),
@@ -1055,6 +1218,48 @@
         for (const e of S.exams) await DB.deleteExam(e.id);
         S.exams = []; S.exam = null; S.scans = []; S.students = []; buildNav(); go('exams');
       } }, 'Delete all data'))));
+  }
+
+  async function aiSettingsCard() {
+    const st = S.settings, ai = st.ai;
+    const card = el('div', { class: 'card', id: 'aiSettings' }, el('h3', {}, 'AI suggestions (Google Gemini)'));
+    if (!aiReady()) card.appendChild(el('p', { class: 'small warntext', id: 'aiNeedServer' }, 'Needs the Apps Script URL and token above, with a GEMINI_KEY script property on that server.'));
+    const on = el('input', { type: 'checkbox', id: 'ai_on', checked: !!ai.enabled });
+    on.onchange = () => { ai.enabled = on.checked; saveSettings(); };
+    const sel = el('select', { id: 'ai_model' });
+    const fillModels = () => {
+      sel.innerHTML = '';
+      const auto = AI.pickDefault(ai.models);
+      sel.appendChild(el('option', { value: '' }, 'Automatic' + (auto ? ': ' + auto : ' (load models first)')));
+      ai.models.forEach(m => sel.appendChild(el('option', { value: m, selected: ai.model === m }, m)));
+      if (ai.model && !ai.models.includes(ai.model)) sel.appendChild(el('option', { value: ai.model, selected: true }, ai.model));
+    };
+    fillModels();
+    sel.onchange = () => { ai.model = sel.value; saveSettings(); };
+    const num = (key, attrs) => { const i = el('input', { type: 'number', class: 'narrow', ...attrs }); i.value = ai[key]; i.oninput = () => { if (+i.value > 0) { ai[key] = +i.value; saveSettings(); } }; return i; };
+    const msg = el('span', { class: 'small', id: 'aiTestMsg' });
+    const loadModels = async () => {
+      msg.textContent = 'Contacting the server...';
+      try {
+        const r = await AI.post(st.cloudUrl, st.cloudToken, { action: 'aiModels' });
+        if (!r.ok) { msg.textContent = 'Failed: ' + r.error; return; }
+        ai.models = r.models || []; await saveSettings(); fillModels();
+        msg.textContent = `Connected. ${ai.models.length} models available; using ${AI.modelOf(ai) || 'none'}.`;
+      } catch (err) { msg.textContent = 'Failed: ' + err.message; }
+    };
+    const used = await AI.today();
+    card.appendChild(el('label', { class: 'small' }, on, ' Suggest grades for written answers (button on the Grade screen, by question)'));
+    card.appendChild(el('div', { class: 'row wrap' },
+      field('Model', sel),
+      field('Requests per minute', num('rpm', { id: 'ai_rpm', min: 1, max: 60 })),
+      field('Daily limit', num('dailyCap', { id: 'ai_cap', min: 1, max: 100000 }), `Used today: ${used}`)));
+    card.appendChild(el('div', { class: 'row wrap' },
+      el('button', { class: 'btn', id: 'btnAiTest', disabled: !aiReady(), onclick: loadModels }, 'Test connection and load models'), msg));
+    card.appendChild(el('div', { class: 'small muted ainote' },
+      el('p', {}, 'Google\'s free tier allows a limited number of requests per minute and per day for each model (often around 10 to 30 per minute and a few hundred to about a thousand per day; Google changes these limits). One answer is one request. The app slows itself down and stops at the daily limit set here.'),
+      el('p', {}, 'Only the cropped image of the answer box is sent, together with the question, answer key, rubric, preset comments and up to 4 of your graded answers to the same question as examples. Student names, IDs and the cover page are never sent.'),
+      el('p', {}, 'On Google\'s free tier, submitted content may be used by Google to improve its products and may be read by human reviewers. You are responsible for following your school\'s privacy rules (for example FERPA) before using this feature. Every suggestion must be accepted by you before it counts.')));
+    return card;
   }
 
   async function exportBackup(withScans) {
@@ -1092,6 +1297,7 @@
       ['Check pages', 'On the Scan screen each student shows the handwritten name, the read ID and the page chips. Fix the ID, page numbers or move pages to another student (drag a page onto a student card or use "Move to").'],
       ['Review', 'Review lists bubbles that were too light or doubly marked. Choose the intended answer. Unreviewed questions get no mark and no points.'],
       ['Grade written work', 'Grade > by question or by student. Tap points (half points available), add preset or typed comments, and write on the answer with the pen or stamp a check or cross. Everything saves automatically.'],
+      ['AI suggestions (optional)', 'Settings > AI suggestions: turn it on after adding GEMINI_KEY to the Apps Script server. On Grade > By question, grade a few answers yourself, then use "Suggest grades (AI)". Each suggestion is pending (dashed marks) until you Accept, Edit or Reject it; pending suggestions are not counted in totals or exports.'],
       ['Export', 'Results > View a student to see the marked pages and override any answer. Export each student\'s PDF, the combined class PDF, CSV or Excel gradebook, or Save to Google Drive after setting it up in Settings.'],
       ['Backup', 'Settings > Export backup regularly. Data lives only in this browser until you export or save to Drive.']
     ];
