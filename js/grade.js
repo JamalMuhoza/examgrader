@@ -22,7 +22,7 @@ const Grade = (() => {
   function compute(exam, L, stu, scans, roster) {
     const P = pagesOf(stu, scans);
     const out = { mc: {}, sa: {}, mcTotal: 0, saTotal: 0, mcMax: 0, saMax: 0, flags: 0, ungraded: 0, missing: [], dups: P.dups.length, unknown: P.unknown.length };
-    for (let p = 1; p <= L.pageCount; p++) if (!P.pages[p]) out.missing.push(p);
+    for (let p = 1; p <= L.pageCount; p++) if (!P.pages[p] && !Layout.ungradedPage(L, p)) out.missing.push(p);
     out.id = studentId(stu, P.pages);
     out.idOk = !!stu.idOverride || !!(P.pages[1] && P.pages[1].idRead && P.pages[1].idRead.ok);
     const rmap = rosterMap(roster);

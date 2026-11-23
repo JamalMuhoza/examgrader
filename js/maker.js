@@ -27,6 +27,79 @@ const Maker = (() => {
   const kid = (node, name) => kids(node, name)[0] || null;
   const wval = n => n ? n.getAttributeNS(W, 'val') : null;
 
+  // ---- pictures and super/subscripts in Word files ----
+  const NS_A = 'http://schemas.openxmlformats.org/drawingml/2006/main', NS_R = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+  const NS_WP = 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing', NS_V = 'urn:schemas-microsoft-com:vml';
+  const IMG_TOKEN = /\u0001IMG(\d+)\u0001/g, TBL_TOKEN = /^\u0001TBL(\d+)\u0001$/;
+  const SUPM = { '0': '⁰', '1': '¹', '2': '²', '3': '³', '4': '⁴', '5': '⁵', '6': '⁶', '7': '⁷', '8': '⁸', '9': '⁹', '+': '⁺', '-': '⁻', '−': '⁻', '=': '⁼', '(': '⁽', ')': '⁾', 'n': 'ⁿ' };
+  const SUBM = { '0': '₀', '1': '₁', '2': '₂', '3': '₃', '4': '₄', '5': '₅', '6': '₆', '7': '₇', '8': '₈', '9': '₉', '+': '₊', '-': '₋', '−': '₋', '=': '₌', '(': '₍', ')': '₎' };
+  function vScript(t, va) {
+    if (va !== 'superscript' && va !== 'subscript') return t;
+    const map = va === 'superscript' ? SUPM : SUBM;
+    if (!t.trim()) return t;
+    if (t.split('').every(c => map[c] !== undefined || c === ' ')) return t.split('').map(c => map[c] || '').join('');
+    return (va === 'superscript' ? '^(' : '_(') + t + ')';
+  }
+  // rId -> picture file of word/document.xml
+  async function docxRels(zip) {
+    const f = zip.file('word/_rels/document.xml.rels');
+    const map = {};
+    if (!f) return map;
+    const x = new DOMParser().parseFromString(await f.async('string'), 'application/xml');
+    for (const r of x.getElementsByTagName('Relationship')) map[r.getAttribute('Id')] = 'word/' + r.getAttribute('Target').replace(/^\/?word\//, '').replace(/^\.\//, '');
+    return map;
+  }
+  // a <w:drawing> or <w:pict>: picture reference and its size in points
+  function drawingRef(node) {
+    const blip = node.getElementsByTagNameNS(NS_A, 'blip')[0];
+    let rid = blip ? blip.getAttributeNS(NS_R, 'embed') : null;
+    if (!rid) { const im = node.getElementsByTagNameNS(NS_V, 'imagedata')[0]; if (im) rid = im.getAttributeNS(NS_R, 'id'); }
+    if (!rid) return null;
+    const ext = node.getElementsByTagNameNS(NS_WP, 'extent')[0];
+    let wpt = ext ? +ext.getAttribute('cx') / 12700 : 0, hpt = ext ? +ext.getAttribute('cy') / 12700 : 0;
+    if (!ext) { const sh = node.getElementsByTagNameNS(NS_V, 'shape')[0]; const st = sh ? sh.getAttribute('style') || '' : ''; const w = st.match(/width:([\d.]+)pt/), h = st.match(/height:([\d.]+)pt/); wpt = w ? +w[1] : 0; hpt = h ? +h[1] : 0; }
+    return { rid, wpt, hpt };
+  }
+  async function mediaData(zip, path) {
+    const f = zip.file(path);
+    if (!f) return null;
+    const ext = path.split('.').pop().toLowerCase();
+    const mime = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', bmp: 'image/bmp', webp: 'image/webp' }[ext];
+    if (!mime) return null;          // EMF / WMF pictures cannot be drawn in the browser
+    const b64 = await f.async('base64');
+    if (mime === 'image/png' || mime === 'image/jpeg') return 'data:' + mime + ';base64,' + b64;
+    try {   // other formats: redraw as PNG for the PDF
+      const im = await U.loadImage('data:' + mime + ';base64,' + b64);
+      const c = document.createElement('canvas'); c.width = im.width; c.height = im.height;
+      const ctx = c.getContext('2d'); ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height); ctx.drawImage(im, 0, 0);
+      return c.toDataURL('image/png');
+    } catch (e) { return null; }
+  }
+  // a Word table drawn as a picture (for a written page): grid lines and cell text
+  function tableImage(rows, caption) {
+    const K = 2.5, pad = 6, font = 11;
+    const nC = Math.max(...rows.map(r => r.length));
+    const c = document.createElement('canvas'), ctx = c.getContext('2d');
+    ctx.font = `${font}px "DejaVu Sans", Arial, sans-serif`;
+    const W = 520, colW = W / nC;
+    const wrapCell = t => { const out = []; String(t || '').split('\n').forEach(par => { let line = ''; par.split(/\s+/).forEach(w => { const tt = line ? line + ' ' + w : w; if (ctx.measureText(tt).width > colW - 2 * pad && line) { out.push(line); line = w; } else line = tt; }); out.push(line); }); return out; };
+    const cells = rows.map(r => Array.from({ length: nC }, (_, k) => wrapCell(r[k])));
+    const rowH = cells.map((r, i) => Math.max(i === 0 ? 22 : 70, ...r.map(l => l.length * (font + 3) + 2 * pad)));
+    const capH = caption ? 28 : 0;
+    const H = capH + rowH.reduce((a, b) => a + b, 0) + 2;
+    c.width = Math.round((W + 2) * K); c.height = Math.round(H * K);
+    const g = c.getContext('2d'); g.scale(K, K); g.fillStyle = '#fff'; g.fillRect(0, 0, W + 2, H);
+    g.fillStyle = '#000'; g.strokeStyle = '#000'; g.lineWidth = 0.8;
+    if (caption) { g.font = `bold 12px "DejaVu Sans", Arial, sans-serif`; g.fillText(caption, 1, 16); }
+    g.font = `${font}px "DejaVu Sans", Arial, sans-serif`;
+    let y = capH + 1;
+    cells.forEach((r, i) => {
+      r.forEach((ls, k) => { g.strokeRect(1 + k * colW, y, colW, rowH[i]); ls.forEach((l, j) => g.fillText(l, 1 + k * colW + pad, y + pad + font + j * (font + 3))); });
+      y += rowH[i];
+    });
+    return { src: c.toDataURL('image/png'), w: c.width, h: c.height, wpt: (W + 2) * 0.75 * 1.25, hpt: H * 0.75 * 1.25 };
+  }
+
   async function docxToText(buf) {
     const zip = await JSZip.loadAsync(buf);
     const read = async p => { const f = zip.file(p); return f ? new DOMParser().parseFromString(await f.async('string'), 'application/xml') : null; };
@@ -55,7 +128,42 @@ const Maker = (() => {
     const counters = {};
     const lines = [];
     const body = doc.getElementsByTagNameNS(W, 'body')[0];
-    for (const p of body.getElementsByTagNameNS(W, 'p')) {
+    const rels = await docxRels(zip);
+    const pics = [], tables = [];
+    // block order: paragraphs, tables (a table with 2+ rows and 2+ columns becomes one token line), content controls
+    const blocks = [];
+    const visit = node => {
+      for (const c of Array.from(node.childNodes)) {
+        if (c.namespaceURI !== W) continue;
+        if (c.localName === 'p') blocks.push(c);
+        else if (c.localName === 'tbl') {
+          const trs = kids(c, 'tr');
+          const nC = Math.max(0, ...trs.map(tr => kids(tr, 'tc').length));
+          if (trs.length >= 2 && nC >= 2) blocks.push({ tbl: c, trs });
+          else for (const tr of trs) for (const tc of kids(tr, 'tc')) visit(tc);
+        } else if (c.localName === 'sdt') { const sc = kid(c, 'sdtContent'); if (sc) visit(sc); }
+        else if (c.localName === 'customXml' || c.localName === 'ins' || c.localName === 'smartTag') visit(c);
+      }
+    };
+    visit(body);
+    const runText = (r) => {
+      const rPr = kid(r, 'rPr');
+      if (rPr && kid(rPr, 'vanish') && wval(kid(rPr, 'vanish')) !== '0' && wval(kid(rPr, 'vanish')) !== 'false') return '';   // hidden text
+      const va = rPr ? wval(kid(rPr, 'vertAlign')) : null;
+      let out = '';
+      for (const t of Array.from(r.childNodes)) {
+        if (t.namespaceURI !== W) continue;
+        if (t.localName === 't') out += vScript(t.textContent, va);
+        else if (t.localName === 'tab') out += '\t';
+        else if (t.localName === 'br' || t.localName === 'cr') out += '\n';
+        else if (t.localName === 'drawing' || t.localName === 'pict') { const d = drawingRef(t); if (d) { pics.push(d); out += '\u0001IMG' + (pics.length - 1) + '\u0001'; } }
+      }
+      return out;
+    };
+    const cellText = tc => { let o = []; for (const p of tc.getElementsByTagNameNS(W, 'p')) { let t = ''; for (const r of p.getElementsByTagNameNS(W, 'r')) t += runText(r); o.push(t.replace(IMG_TOKEN, '')); } return o.join('\n').trim(); };
+    for (const blk of blocks) {
+      if (blk.tbl) { tables.push(blk.trs.map(tr => kids(tr, 'tc').map(cellText))); lines.push('\u0001TBL' + (tables.length - 1) + '\u0001'); continue; }
+      const p = blk;
       const pPr = kid(p, 'pPr');
       // runs (including those inside hyperlinks, smart tags and tracked insertions)
       let text = '', boldChars = 0, allChars = 0;
@@ -66,12 +174,9 @@ const Maker = (() => {
             const rPr = kid(c, 'rPr');
             const strong = !!rPr && ((kid(rPr, 'b') && wval(kid(rPr, 'b')) !== '0' && wval(kid(rPr, 'b')) !== 'false') || (kid(rPr, 'highlight') && wval(kid(rPr, 'highlight')) !== 'none') ||
               (kid(rPr, 'u') && wval(kid(rPr, 'u')) !== 'none') || (kid(rPr, 'shd') && /^[0-9A-F]{6}$/i.test(kid(rPr, 'shd').getAttributeNS(W, 'fill') || '') && !/^FFFFFF$/i.test(kid(rPr, 'shd').getAttributeNS(W, 'fill'))));
-            for (const t of Array.from(c.childNodes)) {
-              if (t.namespaceURI !== W) continue;
-              if (t.localName === 't') { const s = t.textContent; text += s; const n = s.replace(/\s/g, '').length; allChars += n; if (strong) boldChars += n; }
-              else if (t.localName === 'tab') text += '\t';
-              else if (t.localName === 'br' || t.localName === 'cr') text += '\n';
-            }
+            const s = runText(c);
+            text += s;
+            const n = s.replace(IMG_TOKEN, '').replace(/\s/g, '').length; allChars += n; if (strong) boldChars += n;
           } else if (c.localName === 'del' || c.localName === 'pPr' || c.localName === 'rPr') continue;
           else walk(c);
         }
@@ -96,7 +201,13 @@ const Maker = (() => {
       const strong = allChars > 0 && boldChars === allChars;
       text.split('\n').forEach(t => lines.push((strong ? BOLD : '') + t));
     }
-    return { text: lines.join('\n'), images };
+    // picture data for the tokens
+    const media = { images: [], tables };
+    for (const d of pics) {
+      const src = rels[d.rid] ? await mediaData(zip, rels[d.rid]) : null;
+      media.images.push(src ? { src, wpt: d.wpt || 120, hpt: d.hpt || 90 } : null);
+    }
+    return { text: lines.join('\n'), images, media };
   }
 
   // ---------------- .pdf -> text pages (+ images of pages without text) ----------------
@@ -170,6 +281,8 @@ const Maker = (() => {
       if (/\.docx$/.test(n) || f.type === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
         const buf = await f.arrayBuffer();
         const r = await docxToText(buf); out.kinds.push('docx');
+        if (files.length === 1) out.media = r.media;
+        else r.text = r.text.replace(IMG_TOKEN, '').replace(/\u0001TBL\d+\u0001/g, '');
         const tpl = files.length === 1 ? await parseTemplateDocx(buf) : null;
         if (tpl) { out.template = tpl; out.figures += tpl.figures; } else out.figures += r.images;
         addText(r.text);
@@ -177,6 +290,11 @@ const Maker = (() => {
         const r = await pdfExtract(await f.arrayBuffer(), (p, t) => onProgress && onProgress(`Reading ${f.name}: page ${p} of ${t}`));
         out.kinds.push('pdf'); out.figures += r.images;
         r.pages.forEach(p => p.image ? addImg(p.image) : addText(p.text));
+        // typed PDF (one file): cut the questions out of the page images so the printed exam keeps the original look
+        if (files.length === 1 && typeof PdfSrc !== 'undefined' && r.pages.some(p => !p.image)) {
+          try { out.pdfLook = await PdfSrc.analyze(await f.arrayBuffer(), { meta: pdfMeta, onProgress: t => onProgress && onProgress(`${f.name}: ${t}`) }); }
+          catch (err) { console.error(err); out.pdfLookError = err.message; }
+        }
       } else if (/\.(txt|text|md)$/.test(n) || /^text\//.test(f.type)) {
         out.kinds.push('txt'); addText(await f.text());
       } else if (/\.(jpe?g|png|webp|heic)$/.test(n) || /^image\//.test(f.type)) {
@@ -223,6 +341,25 @@ const Maker = (() => {
     parts.push(rest.trim());
     return parts;
   }
+  // a choice line with one or more labels: after a tab or 2+ spaces any unused letter starts a choice (column layouts);
+  // after a single space only the next letter in sequence does ("A. x B. y C. z")
+  function splitLabels(s) {
+    const m0 = s.match(/^(\*\s*)?\(?([A-Ha-h])\s*[.)](?=\s|$)/);
+    if (!m0) return [s];
+    const cuts = [{ at: 0, sep: '', L: m0[2] }];
+    const re = /(\t|\s{2,}|\s)(\*\s*)?\(?([A-Ha-h])\s*[.)](?=\s)/g;
+    let m;
+    while ((m = re.exec(s))) { if (m.index > 0) cuts.push({ at: m.index + m[1].length, sep: m[1], L: m[3] }); re.lastIndex = m.index + 1; }
+    const acc = [cuts[0]], used = new Set([cuts[0].L.toUpperCase()]);
+    for (const c of cuts.slice(1)) {
+      const prev = acc[acc.length - 1], U = c.L.toUpperCase();
+      if (used.has(U)) continue;
+      const strong = c.sep === '\t' || c.sep.length >= 2;
+      const seq = LET.indexOf(U) === LET.indexOf(prev.L.toUpperCase()) + 1 && (c.L === U) === (prev.L === prev.L.toUpperCase());
+      if (strong || seq) { acc.push(c); used.add(U); }
+    }
+    return acc.map((c, i) => s.slice(c.at, i + 1 < acc.length ? acc[i + 1].at : s.length).trim());
+  }
   // a question line that also holds its choices: "1. Stem? A. x B. y"
   function splitStemChoices(stem) {
     const m = stem.match(/\s(\*?\s*\(?[Aa]\s*[.)])\s/);
@@ -244,8 +381,10 @@ const Maker = (() => {
     return out;
   }
 
-  function parse(text) {
-    const res = { title: '', fields: {}, mc: [], sa: [], warnings: [], skipped: [], keyApplied: 0, source: 'parser' };
+  function parse(text, media) {
+    const res = { title: '', fields: {}, mc: [], sa: [], warnings: [], skipped: [], keyApplied: 0, source: 'parser', pages: [] };
+    const IMGS = (media && media.images) || [], TBLS = (media && media.tables) || [];
+    let heading = '';
     const lines = String(text || '').replace(/\r/g, '').split('\n');
     let mode = 'mc', cur = null, lastField = null, started = false, keyMode = false, defMC = null, defSA = null;
     const keyMap = new Map(), saKeys = new Map();
@@ -263,22 +402,54 @@ const Maker = (() => {
       cur = { type: 'sa', num, prompt: p.s, points: p.pts, key: '', rubric: '', lines: null };
       res.sa.push(cur); lastField = 'prompt'; started = true;
     };
+    // choices are stored by their letter, so "A. x <tab> C. z" then "B. y <tab> D. w" (two columns) land in order
     function addChoice(t, bold) {
       const m = t.match(RE.choice);
       if (!m) return false;
       let body = m[3], marked = !!m[1];
       if (RE.mark.test(body)) { marked = true; body = body.replace(RE.mark, ''); }
-      cur.choices.push(clean(body)); cur.bold.push(!!bold);
-      if (marked) { cur.correct = cur.choices.length - 1; cur.marks++; }
+      let idx = LET.indexOf(m[2].toUpperCase());
+      if (cur.choices[idx] !== undefined) { if (cur.lastIdx !== undefined) cur.choices[cur.lastIdx] = clean(cur.choices[cur.lastIdx] + ' ' + t); return true; }
+      cur.choices[idx] = clean(body); cur.bold[idx] = !!bold; cur.lastIdx = idx;
+      if (marked) { cur.correct = idx; cur.marks++; }
       lastField = 'choice';
       return true;
     }
+    const firstEmpty = q => { for (let k = 0; k < q.choices.length; k++) if (q.choices[k] === undefined) return k; return q.choices.length; };
     for (let raw of lines) {
       const bold = raw.startsWith(BOLD);
       raw = raw.replace(new RegExp(BOLD, 'g'), '');
-      const t = clean(raw);
-      if (!t) continue;
       let m;
+      // a table: a written page (the teacher's table, drawn as a picture, answered on the paper)
+      if ((m = raw.trim().match(TBL_TOKEN))) {
+        const rows = TBLS[+m[1]];
+        finishQ();
+        if (rows && typeof document !== 'undefined') {
+          const nC = Math.max(...rows.map(r => r.length));
+          res.pages.push({ kind: 'ignored', suggest: 'written', page: res.pages.length + 1, caption: heading || 'Table', img: tableImage(rows, heading), rows: rows.length - 1, cols: nC, points: Math.max(1, (rows.length - 1) * (nC - 1)), why: 'a table: not used by default. Choose "Written page" to print it with answer space, or "Reference page" to print it ungraded.' });
+        } else res.skipped.push({ raw: '(table)', why: 'table' });
+        heading = '';
+        continue;
+      }
+      // pictures: placed with the question part they belong to
+      const pics = [];
+      raw = raw.replace(IMG_TOKEN, (x, n) => { if (IMGS[+n]) pics.push(IMGS[+n]); return ' '; });
+      const t = clean(raw);
+      if (pics.length && !t) {
+        if (!cur) { res.skipped.push({ raw: '(picture)', why: 'picture outside the questions' }); continue; }
+        if (cur.type === 'mc' && lastField === 'choice' && !String(cur.choices[cur.lastIdx]).replace('[picture]', '').trim()) {
+          const k = cur.lastIdx; cur.choiceImgs = cur.choiceImgs || []; cur.choiceImgs[k] = (cur.choiceImgs[k] ? cur.choiceImgs[k] : pics[0]); cur.choices[k] = '[picture]';
+          pics.slice(1).forEach(im => (cur.imgs = cur.imgs || []).push(im));
+        } else (cur.imgs = cur.imgs || []).push(...pics);
+        continue;
+      }
+      if (!t) continue;
+      // a "Section B: ..." heading (not a question-type heading): ends the question; caption for a table that follows
+      if (/^(?:section|part)\s+(?:[A-Z]|\d{1,2}|[IVX]{1,4})\b/i.test(t) && !RE.section.test(t) && t.length < 160 && started) {
+        finishQ(); heading = t; res.skipped.push({ raw: t, why: 'section heading' }); continue;
+      }
+      if (pics.length) res.__pics = pics;
+      else delete res.__pics;
       // section headings
       if ((m = t.match(RE.section)) && t.length < 90) {
         keyMode = false; finishQ();
@@ -318,26 +489,30 @@ const Maker = (() => {
         continue;
       }
       // a new question
-      if ((m = t.match(RE.sa))) { newSA(+m[1], m[2]); continue; }
+      if ((m = t.match(RE.sa))) { newSA(+m[1], m[2]); if (pics.length) cur.imgs = pics.slice(); continue; }
       if ((m = t.match(RE.q)) || (m = t.match(RE.qp))) {
         if (mode === 'sa') newSA(+m[1], m[2]); else newMC(+m[1], m[2], bold);
+        if (pics.length) cur.imgs = pics.slice();
         continue;
       }
       if (!cur) { res.skipped.push({ raw: t, why: started ? 'not attached to a question' : 'before the first question' }); continue; }
       if (cur.type === 'mc') {
         if ((m = t.match(RE.ansLine))) { const i = LET.indexOf(m[1].toUpperCase()); cur.keyLine = i; continue; }
         const cm = t.match(RE.choice);
-        if (cm && LET.indexOf(cm[2].toUpperCase()) === cur.choices.length) {
-          splitInline(t, cur.choices.length).forEach(x => addChoice(x, bold));
+        if (cm && LET.indexOf(cm[2].toUpperCase()) === firstEmpty(cur)) {
+          splitLabels(raw.replace(/\u00a0/g, ' ').replace(IMG_TOKEN, ' ').trim()).forEach(x => addChoice(x, bold));
+          if (pics.length) { const k = cur.lastIdx; cur.choiceImgs = cur.choiceImgs || []; cur.choiceImgs[k] = pics[0]; if (!cur.choices[k]) cur.choices[k] = '[picture]'; pics.slice(1).forEach(im => (cur.imgs = cur.imgs || []).push(im)); }
           continue;
         }
+        if (pics.length) (cur.imgs = cur.imgs || []).push(...pics);
         if ((m = t.match(/^points?\s*:\s*(\d+(?:\.\d+)?)/i))) { cur.points = +m[1]; continue; }
         // continuation of the stem or of the last choice
-        if (lastField === 'choice') cur.choices[cur.choices.length - 1] = clean(cur.choices[cur.choices.length - 1] + ' ' + t);
+        if (lastField === 'choice') cur.choices[cur.lastIdx] = clean(cur.choices[cur.lastIdx] + ' ' + t);
         else { const p = takePoints(t); if (p.pts !== null && cur.points === null) cur.points = p.pts; cur.stem = cur.stem ? cur.stem + '\n' + p.s : p.s; }
         continue;
       }
       // written question fields
+      if (pics.length) (cur.imgs = cur.imgs || []).push(...pics);
       if ((m = t.match(/^(?:key|answer|answer\s*key|model\s*answer|sample\s*answer)\s*:\s*(.*)$/i))) { cur.key = clean((cur.key ? cur.key + ' ' : '') + m[1]); lastField = 'key'; continue; }
       if ((m = t.match(/^rubric\s*:\s*(.*)$/i))) { cur.rubric = (cur.rubric ? cur.rubric + '\n' : '') + clean(m[1]); lastField = 'rubric'; continue; }
       if ((m = t.match(/^(?:lines|box(?:\s*height)?|space)\s*:\s*(\d{1,2})/i))) { cur.lines = +m[1]; lastField = 'lines'; continue; }
@@ -349,10 +524,16 @@ const Maker = (() => {
 
     // ---- post-processing and checks ----
     const W_ = (msg, raw, level = 'warn') => res.warnings.push({ level, msg, raw });
+    res.mc.forEach(q => {
+      const holes = [];
+      for (let k = 0; k < q.choices.length; k++) if (q.choices[k] === undefined) { holes.push(LET[k]); q.choices[k] = ''; q.bold[k] = false; }
+      if (holes.length) W_(`Question ${q.num}: choice ${holes.join(', ')} was not found (a later choice letter was). It is left empty; check the question.`, q.stem);
+      delete q.lastIdx;
+    });
     // questions with no choices in the multiple-choice part become written questions (never dropped)
     res.mc = res.mc.filter(q => {
       if (q.choices.length) return true;
-      res.sa.push({ type: 'sa', num: q.num, prompt: q.stem, points: q.points, key: '', rubric: '', lines: null, fromMC: true });
+      res.sa.push({ type: 'sa', num: q.num, prompt: q.stem, points: q.points, key: '', rubric: '', lines: null, fromMC: true, imgs: q.imgs });
       W_(`Question ${q.num} has no answer choices, so it was added as a written question. Move it back by adding choices in the editor if needed.`, q.stem);
       return false;
     });
@@ -386,6 +567,8 @@ const Maker = (() => {
     res.mc.forEach(q => { if (q.points === null) q.points = defMC; });
     res.sa.forEach(q => { if (q.points === null) q.points = defSA; });
     res.title = res.fields.title || guessTitle(res.skipped);
+    delete res.__pics;
+    if (!res.pages.length) delete res.pages;
     return finalize(res);
   }
 
@@ -407,6 +590,7 @@ const Maker = (() => {
     res.mc.forEach(q => {
       if (q.choices.length > 5) W_(`Question ${q.num} has ${q.choices.length} choices; the bubble sheet holds 5 (A to E). Choices ${LET.slice(5, q.choices.length).split('').join(', ')} will not be printed: shorten it in the editor.`, q.choices.slice(5).join(' | '));
       if (q.choices.length === 1) W_(`Question ${q.num} has only one choice.`, q.stem);
+      if (res.source !== 'pdf') q.choices.forEach((c, k) => { const m = String(c).match(/(?:^|\s)\(?([A-Ha-h])\s*[.)]\s/); if (m && LET.indexOf(m[1].toUpperCase()) > k) W_(`Question ${q.num}, choice ${LET[k]} contains "${m[1]}." : its choices may not be split correctly. Check this question.`, c); });
       if (!String(q.stem || '').trim()) W_(`Question ${q.num} has no question text.`);
       if (q.fromBold) W_(`Question ${q.num}: correct answer taken from bold/highlighted formatting (${LET[q.correct]}). Check it.`, null, 'info');
     });
@@ -451,7 +635,7 @@ const Maker = (() => {
   function requestsFor(src) {
     const reqs = [];
     src.segments.forEach(seg => {
-      if (seg.text !== undefined) chunkText(seg.text.replace(new RegExp(BOLD, 'g'), '')).forEach(t => reqs.push({ text: t }));
+      if (seg.text !== undefined) chunkText(seg.text.replace(new RegExp(BOLD, 'g'), '').replace(IMG_TOKEN, ' ').replace(/\u0001TBL\d+\u0001/g, '')).forEach(t => reqs.push({ text: t }));
       else for (let i = 0; i < seg.images.length; i += MAX_IMG) reqs.push({ images: seg.images.slice(i, i + MAX_IMG) });
     });
     return reqs;
@@ -515,23 +699,33 @@ const Maker = (() => {
   const OURS = /^(Bubble [A-E0-9]|Write box|Name box|Score box|Points box|Filled|Check|Cross|Corner square \d|Page code)$/;
   const HINTS = [/^Type (?:written )?question \d+ here$/i, /^Choice [A-E]$/, /^Choose correct answer$/i, /^Type the model answer used for grading$/i,
     /^Points per element, for example:/i, /^(?:School name|Course|Teacher|Exam title|Date)$/];
+  const TPL_SIZES = new Set([[5.2, 5.2], [6, 7], [112, 14], [50, 30], [14.5, 12]].map(([w, h]) => Math.round(w * 36000) + 'x' + Math.round(h * 36000)));
   const sdtTag = s => wval(kid(kid(s, 'sdtPr'), 'tag')) || '';
   const normWS = s => String(s || '').replace(/\s+/g, ' ').trim();
   // the template's own instruction text (same as the printed default): kept out of exam.instructions unless the teacher edits it
   const TPL_INSTR = normWS('Write your name in the box and your student ID in the grid, filling one bubble per digit. For multiple choice, completely fill the one bubble next to your answer with a dark pencil or pen. Erase changes cleanly. Write short answers inside the boxes. Work outside the boxes may not be graded. Keep all pages together and do not fold the pages.');
   const MAX_DIGITS = 12, ID_COL = 7.2;
   const twip = v => Math.round(v * 1440 / 25.4);
-  function sdtText(s) {
+  function sdtText(s, pics) {
     const pr = kid(s, 'sdtPr');
     if (kid(pr, 'showingPlcHdr')) return '';
     const content = kid(s, 'sdtContent');
     if (!content) return '';
-    let out = '';
+    let out = '', va = null;
     const walk = (node, depth) => {
       for (const c of Array.from(node.childNodes)) {
         if (c.namespaceURI !== W) continue;
         const n = c.localName;
-        if (n === 't') out += c.textContent;
+        if (n === 'r') { const rp = kid(c, 'rPr'); const keep = va; va = rp ? wval(kid(rp, 'vertAlign')) : null; walk(c, depth + 1); va = keep; continue; }
+        if ((n === 'drawing' || n === 'pict') && pics) {
+          // the template's own bubbles and boxes are not the teacher's pictures
+          const dp = c.getElementsByTagNameNS(NS_WP, 'docPr')[0], ext = c.getElementsByTagNameNS(NS_WP, 'extent')[0];
+          const own = (dp && OURS.test(dp.getAttribute('name') || '')) || (ext && TPL_SIZES.has(Math.round(+ext.getAttribute('cx')) + 'x' + Math.round(+ext.getAttribute('cy'))));
+          const d = own ? null : drawingRef(c);
+          if (d) { pics.push(d); out += '\u0001IMG' + (pics.length - 1) + '\u0001'; }
+          continue;
+        }
+        if (n === 't') out += vScript(c.textContent, va);
         else if (n === 'tab') out += ' ';
         else if (n === 'br' || n === 'cr') out += '\n';
         else if (n === 'del' || n === 'rPr' || n === 'pPr' || n === 'sdtPr' || n === 'instrText') continue;
@@ -658,13 +852,20 @@ const Maker = (() => {
     const res = { title: '', fields: {}, mc: [], sa: [], warnings: [], skipped: [], keyApplied: 0, source: 'template' };
     const num = v => { const m = String(v).replace(',', '.').match(/-?\d+(?:\.\d+)?/); return m ? +m[0] : null; };
     let cur = null;
+    const pics = [];
+    const takePics = v => { const out = []; return { t: String(v).replace(IMG_TOKEN, (x, n) => { out.push(+n); return ''; }).trim(), ids: out }; };
     for (const { s, tag } of tagged) {
       if (tag === 'mcq' || tag === 'saq') continue;
-      const v = sdtText(s);
+      let v = sdtText(s, pics);
+      let ids = [];
+      if (IMG_TOKEN.test(v)) { IMG_TOKEN.lastIndex = 0; const tp = takePics(v); v = tp.t; ids = tp.ids; }
+      IMG_TOKEN.lastIndex = 0;
+      if (ids.length && cur && /^mc_[A-E]$/.test(tag) && cur.type === 'mc') { cur.picIds = cur.picIds || {}; cur.picIds[tag.slice(3)] = ids[0]; if (!v) v = '[picture]'; }
+      else if (ids.length && (tag === 'mc_stem' || tag === 'sa_prompt')) { /* attached below once the block exists */ }
       let m;
       if ((m = tag.match(/^hdr_(\w+)$/))) { if (v && !(m[1] === 'instructions' && normWS(v) === TPL_INSTR)) res.fields[m[1]] = v; continue; }
-      if (tag === 'mc_stem') { cur = { type: 'mc', num: res.mc.length + 1, stem: v, raw: {}, keyLetter: '', points: null }; res.mc.push(cur); continue; }
-      if (tag === 'sa_prompt') { cur = { type: 'sa', num: res.sa.length + 1, prompt: v, points: null, key: '', rubric: '', lines: null }; res.sa.push(cur); continue; }
+      if (tag === 'mc_stem') { cur = { type: 'mc', num: res.mc.length + 1, stem: v, raw: {}, keyLetter: '', points: null, stemPics: ids }; res.mc.push(cur); continue; }
+      if (tag === 'sa_prompt') { cur = { type: 'sa', num: res.sa.length + 1, prompt: v, points: null, key: '', rubric: '', lines: null, stemPics: ids }; res.sa.push(cur); continue; }
       if (!cur) continue;
       if ((m = tag.match(/^mc_([A-E])$/)) && cur.type === 'mc') { if (!(m[1] in cur.raw)) cur.raw[m[1]] = v; continue; }
       if (tag === 'mc_key' && cur.type === 'mc') { cur.keyLetter = v; continue; }
@@ -676,10 +877,22 @@ const Maker = (() => {
       else if (tag === 'sa_points') cur.points = num(v);
     }
     const W_ = (msg, raw, level = 'warn') => res.warnings.push({ level, msg, raw });
+    // pictures pasted into the question and choice boxes
+    if (pics.length) {
+      const rels = await docxRels(zip);
+      const data = [];
+      for (const d of pics) { const src = rels[d.rid] ? await mediaData(zip, rels[d.rid]) : null; data.push(src ? { src, wpt: d.wpt || 120, hpt: d.hpt || 90 } : null); }
+      [...res.mc, ...res.sa].forEach(q => {
+        const sp = (q.stemPics || []).map(i => data[i]).filter(Boolean);
+        if (sp.length) q.imgs = sp;
+        if (q.picIds) { q.choiceImgs = []; Object.entries(q.picIds).forEach(([L, i]) => { q.choiceImgs[LET.indexOf(L)] = data[i] || null; }); }
+      });
+    }
+    [...res.mc, ...res.sa].forEach(q => { delete q.stemPics; delete q.picIds; });
     // unused (empty) blocks are skipped; everything typed is kept
     let emptyMC = 0, emptySA = 0;
-    res.mc = res.mc.filter(q => { const any = q.stem || Object.values(q.raw).some(Boolean); if (!any) emptyMC++; return any; });
-    res.sa = res.sa.filter(q => { const any = q.prompt || q.key || q.rubric; if (!any) emptySA++; return any; });
+    res.mc = res.mc.filter(q => { const any = q.stem || Object.values(q.raw).some(Boolean) || (q.imgs || []).length; if (!any) emptyMC++; return any; });
+    res.sa = res.sa.filter(q => { const any = q.prompt || q.key || q.rubric || (q.imgs || []).length; if (!any) emptySA++; return any; });
     res.mc.forEach((q, i) => {
       q.num = i + 1;
       let last = -1;
@@ -716,6 +929,57 @@ const Maker = (() => {
     return finalize(res);
   }
 
+  // ---------------- PDF original look: merge the layout reader with the text parser ----------------
+  // lines the layout reader must not glue onto a question: answer lines, answer keys, written questions, section titles
+  function pdfMeta(t) {
+    t = clean(t);
+    if (RE.ansLine.test(t) || /^points?\s*:\s*\d/i.test(t)) return 'meta';
+    const k = t.match(RE.keyHead);
+    if (k && (!k[1].trim() || keyPairs(k[1]).length || /^[A-Ea-e]{3,}$/.test(k[1].replace(/[\s,]/g, '')) || /^key\s*:/i.test(t))) return 'stop';
+    if (RE.sa.test(t) || (RE.section.test(t) && t.length < 90)) return 'stop';
+    return null;
+  }
+  // det = text parser result (answers, points, keys, written questions); ps = PdfSrc result (questions, crops, pages)
+  function mergeLook(det, ps) {
+    const res = { title: det.title, fields: det.fields, mc: [], sa: [], warnings: [], skipped: [], keyApplied: det.keyApplied, source: 'pdf', look: true,
+      pages: ps.pageItems.map(p => ({ ...p })), unused: ps.unused, srcPages: ps.pages };
+    const W_ = (msg, raw, level = 'warn') => res.warnings.push({ level, msg, raw });
+    const byNum = new Map();
+    det.mc.forEach(q => { if (!byNum.has(q.num)) byNum.set(q.num, []); byNum.get(q.num).push(q); });
+    const saByNum = new Map(det.sa.filter(q => q.fromMC).map(q => [q.num, q]));
+    (ps.warnings || []).forEach(w => typeof w === 'string' ? W_(w, null, 'info') : W_(w.msg, w.raw || null, w.level || 'warn'));
+    ps.mc.forEach((p, i) => {
+      const d = (byNum.get(p.num) || []).shift();
+      if (p.odd === 'repeated') W_(`The document numbers two questions ${p.num} (the second one is on page ${p.page}). Both are kept and printed as ${p.num}, as in your document; in the gradebook and the scan review they are Q${i} and Q${i + 1} (questions are counted in order there).`, p.stem);
+      if (p.odd === 'skipped') W_(`The document skips from question ${ps.mc[i - 1] ? ps.mc[i - 1].num : '?'} to ${p.num}; it is printed as ${p.num}, as in your document, and counted as Q${i + 1} in the gradebook.`, p.stem);
+      const tp = takePoints(p.stem);
+      let correct = d && d.choices.length === p.choices.length ? d.correct : null;
+      const marks = p.choices.map(c => RE.mark.test(c));
+      const choices = p.choices.map(c => clean(c.replace(RE.mark, '')));
+      if (p.markedChoice >= 0) correct = p.markedChoice;
+      else if (correct === null && marks.filter(Boolean).length === 1) correct = marks.indexOf(true);
+      const points = tp.pts !== null ? tp.pts : d ? d.points : (saByNum.get(p.num) || {}).points || null;
+      if (!choices.length) {
+        res.sa.push({ type: 'sa', num: p.num, prompt: tp.s, points, key: '', rubric: '', lines: null, fromMC: true, img: p.look.stem });
+        W_(`Question ${p.num} has no answer choices, so it was added as a written question (its original look is kept).`, tp.s);
+        return;
+      }
+      const q = { type: 'mc', num: p.num, page: p.page, stem: tp.s, choices, correct, points, look: p.look, imgChoices: p.imgChoices, kind: 'mc' };
+      if (p.markedChoice >= 0 || marks.some(Boolean)) { q.useText = true; W_(`Question ${p.num}: the document marks the correct answer, so it prints as typed text (the original look would show the mark to students).`); }
+      if (p.choices.length > 5) q.useText = true;
+      res.mc.push(q);
+    });
+    const have = new Set(ps.mc.map(q => q.num));
+    det.mc.filter(q => !have.has(q.num) && q.choices.length).forEach(q => { res.mc.push({ ...q, kind: 'mc' }); W_(`Question ${q.num} was found in the text but not on the page layout; it is printed as typed text.`, q.stem); });
+    det.sa.filter(q => !(q.fromMC && have.has(q.num))).forEach(q => res.sa.push(q));
+    finalize(res);
+    res.warnings = res.warnings.filter(w => !/number\(s\) used more than once/.test(w.msg));
+    const nX = res.pages.filter(p => p.kind === 'ignored').length;
+    W_(`Original look: each question and choice is cut from your PDF and printed next to the bubbles (superscripts, symbols and pictures as in your document).` +
+      (nX ? ` ${nX} page(s) or section(s) without numbered questions (tables, pictures) are not used; you can include each one as a written or reference page below.` : ''), null, 'info');
+    return res;
+  }
+
   // ---------------- import result -> exam fields ----------------
   function toExam(exam, imp) {
     const f = imp.fields || {};
@@ -729,17 +993,35 @@ const Maker = (() => {
       if (/^\d{4}-\d{2}-\d{2}$/.test(f.date)) exam.date = f.date;
       else { const d = new Date(f.date); if (!isNaN(d)) exam.date = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; }
     }
-    exam.mc = imp.mc.map(q => {
+    const kindOf = q => q.kind || 'mc';
+    exam.mc = imp.mc.filter(q => kindOf(q) === 'mc').map(q => {
       const choices = q.choices.slice(0, 5).map(c => String(c));
       while (choices.length < 2) choices.push('');
-      return { id: U.uid('q_'), stem: q.stem || '', choices, answer: (q.correct !== null && q.correct !== undefined && q.correct < choices.length) ? LET[q.correct] : '', points: q.points || 1 };
+      const o = { id: U.uid('q_'), ...(imp.source === 'pdf' && q.num ? { label: String(q.num) } : {}), stem: q.stem || '', choices, answer: (q.correct !== null && q.correct !== undefined && q.correct < choices.length) ? LET[q.correct] : '', points: q.points || 1 };
+      if (q.look) { o.look = { stem: q.look.stem || null, choices: q.look.choices.slice(0, 5) }; while (o.look.choices.length < choices.length) o.look.choices.push(null); o.useText = !!q.useText; }
+      if (q.imgs) o.imgs = q.imgs;
+      if (q.choiceImgs) o.choiceImgs = q.choiceImgs.slice(0, 5);
+      return o;
     });
-    exam.sa = imp.sa.map(q => ({
-      id: U.uid('s_'), prompt: q.prompt || '', max: q.points || 5, lines: Math.max(1, Math.min(28, q.lines || 6)), comments: [],
-      key: q.key || '', modelAnswer: q.key || '', rubric: q.rubric || ''
-    }));
+    const saOf = q => {
+      const o = { id: U.uid('s_'), prompt: q.prompt || '', max: q.points || 5, lines: Math.max(1, Math.min(28, q.lines || 6)), comments: [], key: q.key || '', modelAnswer: q.key || '', rubric: q.rubric || '' };
+      if (q.img) o.img = q.img;
+      if (q.imgs) o.imgs = q.imgs;
+      return o;
+    };
+    exam.sa = imp.sa.map(saOf);
+    // multiple-choice questions the teacher turned into written questions: the original question becomes the prompt picture
+    imp.mc.filter(q => kindOf(q) === 'written').forEach(q => exam.sa.push(saOf({ prompt: [q.stem, ...q.choices.map((c, k) => LET[k] + '. ' + c)].join('\n'), points: q.points || 5, img: q.look ? stackLook(q.look) : null })));
+    const pages = (imp.pages || []).filter(p => p.img);
+    pages.filter(p => p.kind === 'written').forEach(p => exam.sa.push({ id: U.uid('s_'), kind: 'page', prompt: p.caption || 'Written page', img: p.img, max: +p.points > 0 ? +p.points : 10, lines: 0, comments: [], key: '', modelAnswer: '', rubric: '', srcPage: p.page }));
+    exam.refPages = pages.filter(p => p.kind === 'reference').map(p => ({ id: U.uid('r_'), img: p.img, caption: p.caption || '', srcPage: p.page }));
+    exam.frontPages = pages.filter(p => p.kind === 'extra').map(p => ({ id: U.uid('f_'), img: p.img, caption: p.caption || '', srcPage: p.page }));
+    if (imp.look) exam.keepLook = true;
     return exam;
   }
 
-  return { BOLD, CHUNK, MAX_IMG, docxToText, pdfExtract, readFiles, parse, chunkText, requestsFor, aiRead, toExam, finalize, LET, buildWordTemplate, parseTemplateDocx, TPL_BASE };
+  // one picture from a question's stem and choice crops (used when a question becomes a written question)
+  function stackLook(look) { return look.stem || null; }
+
+  return { BOLD, CHUNK, MAX_IMG, docxToText, pdfExtract, readFiles, parse, chunkText, requestsFor, aiRead, toExam, finalize, LET, buildWordTemplate, parseTemplateDocx, TPL_BASE, RE, pdfMeta, mergeLook };
 })();
