@@ -264,3 +264,8 @@ a.btn { text-decoration: none; }
 }
 .imp-pts, .imp-ppts { width: 80px; }
 .impchoice .impcrop { max-height: none; }
+.rich sup, .rich sub, .mc-preview sup, .mc-preview sub { font-size: 70%; line-height: 0; }
+.impfigs { display: flex; flex-wrap: wrap; gap: 8px; margin: 4px 0; }
+.impcrop.fig { border: 1px dashed var(--line); }
+.mc-preview { border-left: 3px solid var(--line); padding: 4px 8px; margin-top: 6px; min-width: 0; overflow-wrap: anywhere; }
+.figwrap { display: inline-flex; gap: 6px; align-items: flex-end; margin: 4px 6px 4px 0; max-width: 100%; }
