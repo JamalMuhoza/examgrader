@@ -9,9 +9,9 @@
  *   { token, action: 'aiGrade', model, prompt, maxPoints, answerKey, rubric, presetComments: [...],
  *     examples: [{ imageB64, points, comment }], imageB64, keyImageB64 }
  *   keyImageB64 (optional): the teacher's answer-key copy of the same answer box (model answer + rubric written in it).
- *   { token, action: 'aiExtract', model, text, images: [jpegB64, ...] (optional, max 8), part, parts }
+ *   { token, action: 'aiExtract', model, text, images: [jpegB64, ...] (optional, max 8), figures: [{ id, where }] (optional), part, parts }
  *   Reads exam questions from a teacher's document text and/or page images and returns them verbatim:
- *   { ok, result: { title, mc: [{ number, stem, choices: [..], correct: index|null, points }], sa: [{ number, prompt, points, key, rubric, lines }] } }
+ *   { ok, result: { title, mc: [{ number, stem, choices: [..], correct: index|null, points, stemFigures: [id], choiceFigures: [{ choice, figure }] }], sa: [{ number, prompt, points, key, rubric, lines }] } }
  * Responses: JSON { ok: true, ... } or { ok: false, error }.
  *
  * Script properties (Project Settings > Script properties):
@@ -233,8 +233,11 @@ function aiGrade_(req) {
 var EXTRACT_RULES = [
   'You copy exam questions from a teacher\'s document into a structured list so they can be printed on a bubble-sheet exam.',
   'Copy every question VERBATIM: the exact wording, numbers, units and punctuation of the document. Do not rewrite, shorten, summarize, correct, translate or reorder anything. Do not invent questions and do not add questions that are not in the document. Do not answer the questions.',
-  'Keep chemistry and math notation as written (H2O, Ca2+, 10^-5, ->, <=>, (aq), units, significant figures).',
-  'mc: multiple-choice questions in document order. stem = the question text without its number. choices = the answer choices in order, WITHOUT their letter labels (no "A.", "b)"). Keep all choices, even if there are more than 5.',
+  'Superscripts and subscripts: write raised text as ^{..} and lowered text as _{..}, exactly as printed: 10^{−3}, H_{2}O, Ca^{2+}, SO_{4}^{2−}, cm^{3}, 1s^{2}2s^{2}. Look at the page images to see which characters are raised or lowered; the text layer alone does not show it. Characters that are already superscript or subscript symbols in the text (such as ⁻ ¹ ₂) may stay as they are.',
+  'Keep every other symbol as printed (×, −, ÷, →, ⇌, ±, °, Greek letters, (aq), units, significant figures). Join lines that only wrap; keep a line break only where the document starts a new line on purpose (for example an equation on its own line).',
+  'mc: multiple-choice questions in document order. stem = the question text without its number. choices = the answer choices in order, WITHOUT their letter labels (no "A.", "b)"). Keep all choices, even if there are more than 5. Every labelled choice is its own element: never merge two choices into one, never split one choice into two, never drop a choice. Choices printed side by side or in two columns are still listed in letter order (A, B, C, D).',
+  'number = the question number exactly as printed, even when the document repeats or skips a number. Never renumber.',
+  'Figures: the request lists the pictures and drawings found in the PDF by id (F1, F2, ...). For each question, stemFigures = the ids of figures that belong to the question text, and choiceFigures = [{choice: 0-based choice index, figure: id}] for choices that are (or contain) a picture. A choice that is only a picture has the text "" (empty). Use only the listed ids; never describe a figure in words instead.',
   'correct = the 0-based index of the correct choice ONLY if the document marks it (an asterisk, "(correct)", bold or highlighted choice, an "Answer: C" line, or an answer key list). If the correct answer is not marked in the document, set correct to null. Never work out the answer yourself.',
   'points = the points printed for the question (for example "(2 pts)"), otherwise omit it. number = the question number as printed.',
   'sa: written / short-answer / essay questions in document order. prompt = the question text without its number. points, key (model answer), rubric and lines (answer-box height) only when the document gives them; otherwise omit them.',
@@ -248,7 +251,10 @@ var EXTRACT_SCHEMA = {
     title: { type: 'STRING' },
     mc: { type: 'ARRAY', items: { type: 'OBJECT', properties: {
       number: { type: 'STRING' }, stem: { type: 'STRING' }, choices: { type: 'ARRAY', items: { type: 'STRING' } },
-      correct: { type: 'INTEGER', nullable: true }, points: { type: 'NUMBER' } }, required: ['stem', 'choices', 'correct'] } },
+      correct: { type: 'INTEGER', nullable: true }, points: { type: 'NUMBER' },
+      stemFigures: { type: 'ARRAY', items: { type: 'STRING' } },
+      choiceFigures: { type: 'ARRAY', items: { type: 'OBJECT', properties: { choice: { type: 'INTEGER' }, figure: { type: 'STRING' } }, required: ['choice', 'figure'] } } },
+      required: ['number', 'stem', 'choices', 'correct'] } },
     sa: { type: 'ARRAY', items: { type: 'OBJECT', properties: {
       number: { type: 'STRING' }, prompt: { type: 'STRING' }, points: { type: 'NUMBER' }, key: { type: 'STRING' },
       rubric: { type: 'STRING' }, lines: { type: 'INTEGER' } }, required: ['prompt'] } }
@@ -267,8 +273,10 @@ function aiExtract_(req) {
   var gemma = /gemma/i.test(model);
   var part = Number(req.part) || 1, parts = Number(req.parts) || 1;
   var p = [];
-  if (gemma) p.push({ text: EXTRACT_RULES + '\n\nReply with ONLY one JSON object, no other text: {"title": string, "mc": [{"number": string, "stem": string, "choices": [string], "correct": number|null, "points": number}], ' +
+  if (gemma) p.push({ text: EXTRACT_RULES + '\n\nReply with ONLY one JSON object, no other text: {"title": string, "mc": [{"number": string, "stem": string, "choices": [string], "correct": number|null, "points": number, "stemFigures": [string], "choiceFigures": [{"choice": number, "figure": string}]}], ' +
     '"sa": [{"number": string, "prompt": string, "points": number, "key": string, "rubric": string, "lines": number}]}' });
+  var figures = (req.figures || []).slice(0, 200).map(function (f) { return f && f.id ? String(f.id) + ': ' + String(f.where || '').slice(0, 160) : ''; }).filter(String);
+  if (figures.length) p.push({ text: 'FIGURES FOUND IN THE PDF (refer to them only by these ids):\n' + figures.join('\n') });
   if (text.trim()) p.push({ text: 'EXAM DOCUMENT TEXT (part ' + part + ' of ' + parts + '):\n' + text });
   images.forEach(function (b64, i) {
     p.push({ text: 'EXAM PAGE IMAGE ' + (i + 1) + ' of ' + images.length + ' (part ' + part + ' of ' + parts + '):' });
@@ -305,7 +313,10 @@ function normalizeExtract_(o) {
     var c = q && q.correct;
     c = (c === null || c === undefined || c === '' || !isFinite(Number(c))) ? null : Math.round(Number(c));
     if (c !== null && (c < 0 || c >= ch.length)) c = null;
-    return { number: str(q && q.number), stem: str(q && q.stem), choices: ch, correct: c, points: num(q && q.points) };
+    var sf = (Array.isArray(q && q.stemFigures) ? q.stemFigures : []).map(str).filter(function (x) { return /^F\d+$/.test(x); });
+    var cf = (Array.isArray(q && q.choiceFigures) ? q.choiceFigures : []).filter(function (x) { return x && /^F\d+$/.test(str(x.figure)) && Number(x.choice) >= 0 && Number(x.choice) < ch.length; })
+      .map(function (x) { return { choice: Math.round(Number(x.choice)), figure: str(x.figure) }; });
+    return { number: str(q && q.number), stem: str(q && q.stem), choices: ch, correct: c, points: num(q && q.points), stemFigures: sf, choiceFigures: cf };
   });
   var sa = (Array.isArray(o.sa) ? o.sa : []).map(function (q) {
     var l = Math.round(Number(q && q.lines));
