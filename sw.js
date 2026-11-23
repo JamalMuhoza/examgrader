@@ -1,9 +1,9 @@
 /* Exam Grader service worker: offline cache for the app shell and the CDN libraries */
-const VERSION = 'examgrader-v8';
+const VERSION = 'examgrader-v10';
 const SHELL = [
   './', './index.html', './style.css', './manifest.webmanifest',
-  './js/util.js', './js/db.js', './js/layout.js', './js/cv.js', './js/annot.js', './js/grade.js', './js/export.js', './js/ai.js', './js/maker.js', './js/app.js', './templates/exam-template-base.docx',
-  './fonts/caveat-400.woff2', './fonts/caveat-600.woff2', './icons/icon.svg', './icons/icon-192.png', './icons/icon-512.png'
+  './js/util.js', './js/db.js', './js/layout.js', './js/cv.js', './js/annot.js', './js/grade.js', './js/export.js', './js/ai.js', './js/pdfsrc.js', './js/maker.js', './js/app.js', './templates/exam-template-base.docx',
+  './fonts/caveat-400.woff2', './fonts/caveat-600.woff2', './fonts/DejaVuSans.ttf', './icons/icon.svg', './icons/icon-192.png', './icons/icon-512.png'
 ];
 const CDN = [
   'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js',
