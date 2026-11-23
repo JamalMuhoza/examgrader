@@ -13,6 +13,12 @@ const Export = (() => {
     doc.addImage(url, 'JPEG', 0, 0, 612, 792, undefined, 'FAST');
   }
 
+  // add a page from an already encoded JPEG data URL (used to build the class PDF from cached student pages)
+  function addJpegPage(doc, url, first) {
+    if (!first) doc.addPage('letter', 'portrait');
+    doc.addImage(url, 'JPEG', 0, 0, 612, 792, undefined, 'FAST');
+  }
+
   // pages: array of canvases (one per exam page, in order)
   function pdfFromCanvases(canvases, title) {
     const doc = newDoc();
@@ -50,5 +56,12 @@ const Export = (() => {
     return j;
   }
 
-  return { pdfFromCanvases, newDoc, addCanvasPage, csv, xlsx, cloudPost };
+  // one ZIP from [{ name, data (Blob | ArrayBuffer | string) }]
+  async function zip(files) {
+    const z = new JSZip();
+    files.forEach(f => z.file(f.name, f.data));
+    return z.generateAsync({ type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 6 } });
+  }
+
+  return { pdfFromCanvases, newDoc, addCanvasPage, addJpegPage, csv, xlsx, cloudPost, zip };
 })();

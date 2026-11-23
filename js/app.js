@@ -6,7 +6,8 @@
   const S = { settings: null, exams: [], exam: null, scans: [], students: [], view: 'exams', imgCache: new Map(), cam: null, session: { studentId: null } };
   const DEFAULT_SETTINGS = {
     school: '', course: '', teacher: '', idDigits: 7,
-    omr: { ...CV.DEFAULT_TH }, blurMin: 12, cloudUrl: '', cloudToken: '', comments: ['Good work', 'Show your work', 'Check units', 'Incomplete answer', 'Sign error']
+    omr: { ...CV.DEFAULT_TH }, blurMin: 12, cloudUrl: '', cloudToken: '', comments: ['Good work', 'Show your work', 'Check units', 'Incomplete answer', 'Sign error'],
+    autoApprove: false
   };
   const VIEWS = [
     ['exams', 'Exams'], ['setup', 'Setup'], ['print', 'Print'], ['scan', 'Scan'], ['review', 'Review'],
@@ -22,6 +23,7 @@
     const last = await DB.getKV('currentExam', null);
     if (last && S.exams.find(e => e.id === last)) await selectExam(last, false);
     buildNav();
+    renderQ();
     const hv = location.hash.replace('#', '');
     go(VIEWS.some(v => v[0] === hv) ? hv : (S.exam ? 'scan' : 'exams'));
     if (window.pdfjsLib) pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
@@ -48,13 +50,14 @@
     S.students = await DB.byExam('students', id);
     S.session.studentId = null;
     S.imgCache.clear();
+    PAGECACHE.clear();
     await DB.setKV('currentExam', id);
     if (render) buildNav();
+    await loadQueue();
   }
 
   function go(view) {
     if (S.cam && view !== 'scan') stopCamera();
-    if (AIR.running) AIR.stop = true;
     S.view = view;
     history.replaceState(null, '', '#' + view);
     $$('.navbtn').forEach(b => b.classList.toggle('active', b.dataset.view === view));
@@ -84,6 +87,16 @@
   const saveSoon = (() => { let t; return () => { clearTimeout(t); t = setTimeout(async () => { await saveExam(); markSaved(); }, 350); }; })();
   function markSaved() { const s = $('#saveState'); if (s) { s.textContent = 'Saved ' + new Date().toLocaleTimeString(); } }
   async function saveStudent(stu) { await DB.put('students', stu); }
+  // any teacher change to a student's grading reopens an approved student as Draft
+  function markDraft(stu) { if (stu && stu.status === 'approved') { stu.status = 'draft'; stu.reopenedAt = Date.now(); stu.approvedAt = null; } }
+  // a teacher change to one written answer: it becomes teacher-graded, its flag is resolved, a queued AI job for it is dropped
+  function teacherEdit(stu, qid) {
+    stu.sa = stu.sa || {};
+    const sa = stu.sa[qid];
+    if (sa) { sa.source = 'teacher'; sa.edited = true; delete sa.flag; }
+    markDraft(stu);
+    dropJob(stu.id, qid);
+  }
   async function saveSettings() { await DB.setKV('settings', S.settings); }
 
   function newExam() {
@@ -167,6 +180,7 @@
       field('Student ID digits', inp(e, 'idDigits', { id: 'f_digits', type: 'number', min: 1, max: 12 }), 'Each digit is a column of bubbles 0-9'),
       field('Cover instructions (optional)', inp(e, 'instructions', { id: 'f_instr', multiline: true, rows: 3, placeholder: 'Leave empty for standard instructions' })));
     v.appendChild(meta);
+    v.appendChild(keyCard());
 
     // multiple choice
     const mcBox = el('div', { class: 'card' });
@@ -220,8 +234,8 @@
               field('Preset comments (comma separated)', (() => { const t = el('input', { class: 'sa-comments' }); t.value = (q.comments || []).join(', '); t.oninput = () => { q.comments = t.value.split(',').map(s => s.trim()).filter(Boolean); saveSoon(); }; return t; })()),
               field('Answer key note (key PDF only)', inp(q, 'key', { class: 'sa-key' }))),
             el('div', { class: 'grid2' },
-              field('Answer key / model answer', inp(q, 'modelAnswer', { multiline: true, rows: 3, class: 'sa-model', placeholder: 'What a full-credit answer contains' }), 'Used by AI suggestions'),
-              field('Rubric', inp(q, 'rubric', { multiline: true, rows: 3, class: 'sa-rubric', placeholder: '2 pts correct product; 1 pt balanced; 1 pt units' }), 'Points per element, one per line or separated by ;'))),
+              field('Typed model answer (optional)', inp(q, 'modelAnswer', { multiline: true, rows: 3, class: 'sa-model', placeholder: 'What a full-credit answer contains' }), 'Optional: supplements the model answer written in this box on the uploaded key'),
+              field('Typed rubric (optional)', inp(q, 'rubric', { multiline: true, rows: 3, class: 'sa-rubric', placeholder: '2 pts correct product; 1 pt balanced; 1 pt units' }), 'Optional: points per element, one per line or separated by ;'))),
           el('div', { class: 'qtools' },
             el('button', { class: 'btn small', title: 'Move up', onclick: () => { if (i) { [e.sa[i - 1], e.sa[i]] = [e.sa[i], e.sa[i - 1]]; saveSoon(); renderSA(); } } }, 'Up'),
             el('button', { class: 'btn small danger', onclick: () => { if (confirm('Remove this question?')) { e.sa.splice(i, 1); saveSoon(); renderSA(); } } }, 'Remove'))));
@@ -332,6 +346,7 @@
   function viewScan(v) {
     const lay = L();
     v.appendChild(el('div', { class: 'row between' }, el('h2', {}, 'Scan pages'), el('span', { class: 'muted small' }, `${lay.pageCount} pages per student`)));
+    v.appendChild(keyCard());
     const camCard = el('div', { class: 'card' },
       el('h3', {}, 'Camera'),
       el('div', { class: 'camwrap hidden', id: 'camWrap' },
@@ -345,8 +360,8 @@
         el('button', { class: 'btn', id: 'btnNextStudent', onclick: () => { S.session.studentId = null; updateCamStatus('Next page should be a cover (new student).'); } }, 'Next student')),
       el('div', { class: 'lastcap', id: 'lastCap' }));
     const upCard = el('div', { class: 'card' },
-      el('h3', {}, 'Upload scans'),
-      el('p', { class: 'small muted' }, 'PDF files from a scanner or photos of pages. Each file may hold one student or a whole class; a cover page starts a new student.'),
+      el('h3', {}, 'Upload student scans'),
+      el('p', { class: 'small muted' }, 'PDF files from a scanner or photos of pages. Each file may hold one student or a whole class; a cover page starts a new student. Grading starts automatically.'),
       el('label', { class: 'btn' }, 'Choose PDF or image files', el('input', { type: 'file', id: 'fileInput', multiple: true, accept: 'application/pdf,image/*', class: 'hidden', onchange: ev => { ingestFiles(Array.from(ev.target.files)).catch(err => { console.error(err); const pr = $('#progress'); if (pr) pr.textContent = 'Error: ' + err.message; toast('Error: ' + err.message, 'bad'); }); ev.target.value = ''; } })),
       el('div', { id: 'progress', class: 'small muted' }));
     v.appendChild(el('div', { class: 'grid2 top' }, camCard, upCard));
@@ -385,7 +400,7 @@
       if (g.id && rosterOf().length && !g.inRoster) warnings.push(`Student ${idx + 1}: ID ${g.id} not in roster.`);
       const cover = P.pages[1];
       const idIn = el('input', { class: 'idfix narrow', value: g.id, title: 'Student ID (edit to correct)' });
-      idIn.onchange = async () => { stu.idOverride = idIn.value.trim(); await saveStudent(stu); renderGroups(); };
+      idIn.onchange = async () => { stu.idOverride = idIn.value.trim(); markDraft(stu); await saveStudent(stu); renderGroups(); };
       const card = el('div', { class: 'card stucard', 'data-stu': stu.id },
         el('div', { class: 'row between wrap' },
           el('div', { class: 'row wrap' },
@@ -400,7 +415,7 @@
         el('div', { class: 'pagestrip' }, P.all.map(s => pageChip(s, P, studs))));
       card.addEventListener('dragover', ev => { ev.preventDefault(); card.classList.add('drop'); });
       card.addEventListener('dragleave', () => card.classList.remove('drop'));
-      card.addEventListener('drop', async ev => { ev.preventDefault(); card.classList.remove('drop'); const id = ev.dataTransfer.getData('text/plain'); const sc = S.scans.find(s => s.id === id); if (sc) { sc.studentId = stu.id; await DB.put('scans', sc); renderGroups(); } });
+      card.addEventListener('drop', async ev => { ev.preventDefault(); card.classList.remove('drop'); const id = ev.dataTransfer.getData('text/plain'); const sc = S.scans.find(s => s.id === id); if (sc) { markDraft(S.students.find(x => x.id === sc.studentId)); markDraft(stu); await DB.putMany('students', S.students); sc.studentId = stu.id; await DB.put('scans', sc); renderGroups(); afterIngest(); } });
       box.appendChild(card);
     });
     if (unassigned.length) {
@@ -427,7 +442,8 @@
     stuSel.onchange = async () => {
       let id = stuSel.value;
       if (id === '__new') { const st = Grade.newStudent(S.exam.id, nextKey()); S.students.push(st); await saveStudent(st); id = st.id; }
-      s.studentId = id || null; await DB.put('scans', s); renderGroups();
+      markDraft(S.students.find(x => x.id === s.studentId)); markDraft(S.students.find(x => x.id === id)); await DB.putMany('students', S.students);
+      s.studentId = id || null; await DB.put('scans', s); renderGroups(); afterIngest();
     };
     const cls = 'pagechip' + (isDup ? ' dup' : '') + (!s.page ? ' unknown' : '') + ((s.warnings || []).length ? ' warnchip' : '');
     const chip = el('div', { class: cls, draggable: 'true', 'data-scan': s.id, 'data-page': s.page || '' },
@@ -525,6 +541,32 @@
     renderGroups(); toast('All scans re-read');
   }
 
+  // decode every page of a PDF or image file and call fn(drawable, width, height, label)
+  async function eachPage(f, p, fn) {
+    if (f.type === 'application/pdf' || /\.pdf$/i.test(f.name)) {
+      const pdf = await pdfjsLib.getDocument({ data: await f.arrayBuffer() }).promise;
+      for (let i = 1; i <= pdf.numPages; i++) {
+        if (p) p.textContent = `${f.name}: page ${i} / ${pdf.numPages}`;
+        const page = await pdf.getPage(i);
+        const base = page.getViewport({ scale: 1 });
+        const scale = Math.min(200 / 72, 2600 / Math.max(base.width, base.height));
+        const vp = page.getViewport({ scale });
+        const c = CV.canvasOf(Math.round(vp.width), Math.round(vp.height));
+        const ctx = c.getContext('2d'); ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
+        await page.render({ canvasContext: ctx, viewport: vp }).promise;
+        await fn(c, c.width, c.height, f.name + ' p' + i, i - 1);
+        page.cleanup();
+        await U.sleep(0);
+      }
+      pdf.destroy();
+    } else {
+      if (p) p.textContent = `${f.name}`;
+      const bm = await U.blobToImage(f);
+      await fn(bm, bm.width, bm.height, f.name, null);
+      if (bm.close) bm.close();
+    }
+  }
+
   async function ingestFiles(files) {
     const p = $('#progress');
     let total = 0;
@@ -536,28 +578,9 @@
       const batchSeq = nextBatch();
       const batch = [];
       for (const f of grp) {
-      if (f.type === 'application/pdf' || /\.pdf$/i.test(f.name)) {
-        const pdf = await pdfjsLib.getDocument({ data: await f.arrayBuffer() }).promise;
-        for (let i = 1; i <= pdf.numPages; i++) {
-          if (p) p.textContent = `${f.name}: page ${i} / ${pdf.numPages}`;
-          const page = await pdf.getPage(i);
-          const base = page.getViewport({ scale: 1 });
-          const scale = Math.min(200 / 72, 2600 / Math.max(base.width, base.height));
-          const vp = page.getViewport({ scale });
-          const c = CV.canvasOf(Math.round(vp.width), Math.round(vp.height));
-          const ctx = c.getContext('2d'); ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
-          await page.render({ canvasContext: ctx, viewport: vp }).promise;
-          batch.push(await makeScan(c, c.width, c.height, batchSeq, i - 1, f.name + ' p' + i));
-          page.cleanup();
-          await U.sleep(0);
-        }
-        pdf.destroy();
-      } else {
-        if (p) p.textContent = `${f.name}`;
-        const bm = await U.blobToImage(f);
-        batch.push(await makeScan(bm, bm.width, bm.height, batchSeq, batch.length, f.name));
-        if (bm.close) bm.close();
-      }
+        await eachPage(f, p, async (src, w, h, label, idx) => {
+          batch.push(await makeScan(src, w, h, batchSeq, idx === null ? batch.length : idx, label));
+        });
       }
       await commitBatch(batch, true);
       total += batch.length;
@@ -565,6 +588,21 @@
     if (p) p.textContent = `Processed ${total} page(s).`;
     toast(`Processed ${total} page(s)`);
     renderGroups();
+    await afterIngest(true);
+  }
+
+  // automatic pipeline after new pages: multiple choice is graded on the fly (OMR + key); written answers go to the AI queue
+  async function afterIngest(announce) {
+    if (!S.exam) return;
+    const n = enqueueMissing();
+    const nStu = S.students.length;
+    if (announce && nStu) {
+      const ungraded = S.students.reduce((a, s) => a + gradeOf(s).ungraded, 0);
+      if (n) toast(`${nStu} student(s): multiple choice graded. AI is grading ${n} written answer(s) in the background.`, 'good');
+      else if (ungraded && S.exam.sa.length) toast(`${nStu} student(s): multiple choice graded. ${ungraded} written answer(s) need grading${aiOn() ? '' : ' (AI grading is off)'}.`);
+      else toast(`${nStu} student(s) graded. Review on Results, then approve.`, 'good');
+    }
+    autoApproveSoon(S.students);
   }
 
   async function commitBatch(batch, fileMode) {
@@ -574,6 +612,131 @@
     for (const st of created) { S.students.push(st); await saveStudent(st); }
     for (const s of batch) { S.scans.push(s); await DB.put('scans', s); }
     return created;
+  }
+
+  // ---------------- Answer key upload (a filled copy of the exam: shaded bubbles + model answer and rubric in each box) ----------------
+  function keyCard() {
+    const card = el('div', { class: 'card keycard', id: 'keyCard' },
+      el('h3', {}, 'Answer key'),
+      el('p', { class: 'small muted' }, 'Print a blank copy of the exam, shade the correct bubbles, and write (or type onto the PDF) the model answer and the rubric with points per element inside each written-answer box. Upload that copy here (PDF or photos, any page order). It is read as the answer key, never as a student. Uploading a new key regrades everything.'),
+      el('div', { class: 'row wrap' },
+        el('label', { class: 'btn primary', id: 'btnUploadKey' }, 'Upload key',
+          el('input', { type: 'file', id: 'keyInput', multiple: true, accept: 'application/pdf,image/*', class: 'hidden', onchange: ev => {
+            const files = Array.from(ev.target.files); ev.target.value = '';
+            ingestKey(files).catch(err => { console.error(err); const p = $('#keyProgress'); if (p) p.textContent = 'Error: ' + err.message; toast('Key upload failed: ' + err.message, 'bad'); });
+          } })),
+        el('span', { class: 'small muted', id: 'keyProgress' })),
+      el('div', { id: 'keySummary' }));
+    renderKeySummary(card.querySelector('#keySummary'));
+    return card;
+  }
+
+  function keyFlags(e) {
+    const ks = e.keyScan; if (!ks) return [];
+    return e.mc.map((q, i) => ({ q, i, r: ks.mc[q.id] })).filter(x => x.r && x.r.status !== 'single' && !x.r.confirmed);
+  }
+
+  function renderKeySummary(box) {
+    box = box || $('#keySummary'); if (!box) return;
+    box.innerHTML = '';
+    const e = S.exam, ks = e.keyScan, lay = L();
+    const keyStr = e.mc.map(q => q.answer || '?').join('');
+    const grouped = keyStr.replace(/(.{5})(?=.)/g, '$1 ');
+    if (!ks) {
+      box.appendChild(el('p', { class: 'small' }, 'No key uploaded yet. Multiple choice uses the answers set in Setup', e.mc.length ? ': ' : '.', e.mc.length ? el('code', { id: 'keyString' }, grouped) : null,
+        e.sa.length ? '. Written answers use the typed model answer and rubric only.' : ''));
+      return;
+    }
+    const nRead = e.mc.filter(q => ks.mc[q.id] && ks.mc[q.id].status === 'single').length;
+    const flags = keyFlags(e);
+    box.appendChild(el('div', { class: 'small' }, el('strong', {}, 'Multiple-choice key: '), el('code', { id: 'keyString' }, grouped)));
+    box.appendChild(el('p', { class: 'small muted', id: 'keyStats' }, `Read from the key copy (${new Date(ks.at).toLocaleString()}): ${nRead} of ${e.mc.length} answers read from the shaded bubbles; key pages ${ks.pages.join(', ') || 'none'}.` + (flags.length ? ` ${flags.length} need your confirmation.` : '')));
+    if (flags.length) {
+      const fl = el('div', { class: 'keyflags', id: 'keyFlags' });
+      flags.forEach(({ q, i, r }) => {
+        const why = r.status === 'missing' ? 'page not in the key upload' : r.status === 'blank' ? 'no bubble shaded' : r.status === 'multiple' ? `several bubbles shaded (${r.marked.join(', ')})` : `unclear mark (${(r.marked || []).join(', ') || 'light'})`;
+        fl.appendChild(el('div', { class: 'keyflag', 'data-q': i + 1 },
+          el('div', { class: 'small' }, el('strong', {}, `Question ${i + 1}: `), why, '. Current key: ', el('strong', {}, q.answer || 'none')),
+          r.crop ? el('img', { class: 'keycrop', src: r.crop, alt: `Key copy of question ${i + 1}` }) : null,
+          el('div', { class: 'row wrap tight' }, q.choices.map((c, k) => el('button', { class: 'btn small' + (q.answer === Layout.LETTERS[k] ? ' primary' : ''), 'data-key-choice': Layout.LETTERS[k], onclick: async () => {
+            q.answer = Layout.LETTERS[k]; r.confirmed = q.answer; await saveExam(false); keyChanged('Key for question ' + (i + 1) + ' confirmed', false);
+          } }, Layout.LETTERS[k])))));
+      });
+      box.appendChild(el('div', { class: 'card warn' }, el('h3', {}, 'Confirm these key answers'), fl));
+    }
+    if (e.sa.length) {
+      box.appendChild(el('div', { class: 'keythumbs', id: 'keyThumbs' }, e.sa.map((q, i) => {
+        const k = ks.sa[q.id];
+        return el('figure', { class: 'keythumb', 'data-sa': i + 1 },
+          k ? el('img', { src: 'data:image/jpeg;base64,' + k.b64, alt: `Key and rubric for SA${i + 1}` }) : el('div', { class: 'nothumb' }, 'no key image'),
+          el('figcaption', {}, `SA${i + 1} (${U.fmt(q.max)} pts)` + (k ? '' : ': not in the key upload; typed key only')));
+      })));
+    }
+    if ((ks.warnings || []).length) box.appendChild(el('ul', { class: 'warnlist small', id: 'keyWarnings' }, ks.warnings.map(w => el('li', {}, w))));
+  }
+
+  async function ingestKey(files) {
+    if (!files.length) return;
+    const p = $('#keyProgress');
+    const lay = L(), e = S.exam;
+    const got = {}, warnings = [];
+    for (const f of files) {
+      await eachPage(f, p, async (src, w, h, label) => {
+        const res = CV.processSource(src, w, h);
+        if (!res.ok) { warnings.push(`${label}: ${res.reason}`); return; }
+        if (!res.page) { warnings.push(`${label}: page code unreadable`); return; }
+        if (res.hash !== lay.hash) { warnings.push(`${label}: belongs to a different exam or version`); return; }
+        if (res.page > lay.pageCount) { warnings.push(`${label}: page number beyond this exam`); return; }
+        if (got[res.page]) { warnings.push(`${label}: page ${res.page} appears twice; the first copy is used`); return; }
+        const c = CV.canvasOf(Layout.RW, Layout.RH);
+        c.getContext('2d').putImageData(res.rect, 0, 0);
+        got[res.page] = { c, rg: res.rg };
+      });
+    }
+    if (p) p.textContent = 'Reading the key...';
+    const ks = { at: Date.now(), pages: Object.keys(got).map(Number).sort((a, b) => a - b), mc: {}, sa: {}, warnings };
+    for (const [pg, { c, rg }] of Object.entries(got)) {
+      const pn = +pg;
+      if (lay.mc.some(q => q.page === pn)) {
+        const a = CV.analyzePage(rg, lay, pn, S.settings.omr);
+        for (const [qid, r] of Object.entries(a.mc)) {
+          const lq = lay.mc.find(m => m.qid === qid);
+          const rec = { status: r.status, choice: r.choice, marked: r.marked, ds: r.ds };
+          if (r.status !== 'single') rec.crop = cropCanvas(c, 11, lq.top - 1.5, 185, lq.h + 1, 0.6).toDataURL('image/jpeg', 0.75);
+          ks.mc[qid] = rec;
+        }
+      }
+      lay.sa.filter(sq => sq.page === pn).forEach(lq => { ks.sa[lq.qid] = AI.boxCrop(c, lq); });
+    }
+    const missingPages = [];
+    for (let pn = 2; pn <= lay.pageCount; pn++) if (!got[pn]) missingPages.push(pn);
+    if (missingPages.length) warnings.push(`Key page(s) ${missingPages.join(', ')} not found in the upload.`);
+    e.mc.forEach(q => {
+      if (!ks.mc[q.id]) ks.mc[q.id] = { status: 'missing', choice: null, marked: [] };
+      const r = ks.mc[q.id];
+      if (r.status === 'single') q.answer = r.choice;
+    });
+    e.keyScan = ks;
+    await saveExam(false);
+    const nRead = e.mc.filter(q => ks.mc[q.id].status === 'single').length;
+    if (p) p.textContent = `Key read: ${nRead} of ${e.mc.length} multiple-choice answers, ${Object.keys(ks.sa).length} of ${e.sa.length} written-answer keys.`;
+    keyChanged('Answer key uploaded');
+  }
+
+  // a new or corrected key regrades everything: MC is recomputed on the fly, AI-graded written answers are re-queued
+  async function keyChanged(msg, regradeSA = true) {
+    let reopened = 0;
+    for (const stu of S.students) { if (stu.status === 'approved') { markDraft(stu); reopened++; await saveStudent(stu); } }
+    let n = 0;
+    if (regradeSA && aiOn()) {
+      const pairs = [];
+      S.students.forEach(stu => S.exam.sa.forEach(q => { if (!isTeacher(stu.sa && stu.sa[q.id]) && saPage(stu, q).scan) pairs.push([stu, q]); }));
+      n = enqueue(pairs, true);
+      runQueue();
+    }
+    renderKeySummary();
+    if (S.view === 'results') refreshDash();
+    toast(msg + (S.students.length ? `. Multiple choice regraded${n ? `; AI is regrading ${n} written answer(s)` : ''}${reopened ? `; ${reopened} approved student(s) set back to Draft` : ''}.` : '.'), 'good');
   }
 
   // ---------------- camera ----------------
@@ -681,6 +844,7 @@
       }
       updateCamStatus('Captured page ' + scan.page + '. Turn to the next page.');
       renderGroups();
+      afterIngest(false);
     } finally { if (S.cam) S.cam.busy = false; }
   }
   function flash(kind) {
@@ -712,7 +876,7 @@
           const crop = cropCanvas(im, b.x - 2, b.y - 2, b.w + 4, b.h + 4, 1);
           const idIn = el('input', { class: 'narrow', value: g.id });
           frag.appendChild(el('div', { class: 'card review' }, el('div', {}, el('strong', {}, `Student ${studs.indexOf(stu) + 1}: student ID`), ' read as ', el('code', {}, g.id)),
-            crop, el('div', { class: 'row' }, idIn, el('button', { class: 'btn primary', onclick: async () => { stu.idOverride = idIn.value.trim(); await saveStudent(stu); render(); } }, 'Confirm ID'))));
+            crop, el('div', { class: 'row' }, idIn, el('button', { class: 'btn primary', onclick: async () => { stu.idOverride = idIn.value.trim(); markDraft(stu); await saveStudent(stu); render(); } }, 'Confirm ID'))));
         }
       }
       for (const stu of studs) {
@@ -728,9 +892,9 @@
           const crop = cropCanvas(im, 11, lq.top - 1.5, 196 - 11, lq.h + 1, 1);
           const read = scan.omr[q.id];
           const btns = el('div', { class: 'row wrap' },
-            q.choices.map((c, k) => el('button', { class: 'btn choicebtn' + (r.answer === Layout.LETTERS[k] ? ' primary' : ''), 'data-choice': Layout.LETTERS[k], onclick: async () => { stu.mcOverride[q.id] = Layout.LETTERS[k]; await saveStudent(stu); render(); } }, Layout.LETTERS[k])),
-            el('button', { class: 'btn', 'data-choice': 'BLANK', onclick: async () => { stu.mcOverride[q.id] = 'BLANK'; await saveStudent(stu); render(); } }, 'Blank'),
-            el('button', { class: 'btn', 'data-choice': 'MULTI', onclick: async () => { stu.mcOverride[q.id] = 'MULTI'; await saveStudent(stu); render(); } }, 'Multiple (wrong)'));
+            q.choices.map((c, k) => el('button', { class: 'btn choicebtn' + (r.answer === Layout.LETTERS[k] ? ' primary' : ''), 'data-choice': Layout.LETTERS[k], onclick: async () => { stu.mcOverride[q.id] = Layout.LETTERS[k]; markDraft(stu); await saveStudent(stu); render(); } }, Layout.LETTERS[k])),
+            el('button', { class: 'btn', 'data-choice': 'BLANK', onclick: async () => { stu.mcOverride[q.id] = 'BLANK'; markDraft(stu); await saveStudent(stu); render(); } }, 'Blank'),
+            el('button', { class: 'btn', 'data-choice': 'MULTI', onclick: async () => { stu.mcOverride[q.id] = 'MULTI'; markDraft(stu); await saveStudent(stu); render(); } }, 'Multiple (wrong)'));
           frag.appendChild(el('div', { class: 'card review', 'data-stu': stu.id, 'data-q': qi + 1 },
             el('div', {}, el('strong', {}, `Student ${studs.indexOf(stu) + 1} (${g.id || 'no ID'}), question ${qi + 1}`), ` - read: ${read.status}${read.reason ? ' (' + read.reason + ')' : ''}, fill levels ${read.ds.map((d, k) => Layout.LETTERS[k] + ' ' + Math.round(d * 100) + '%').join(', ')}`),
             crop, btns));
@@ -752,11 +916,11 @@
     return c;
   }
 
-  // ---------------- Grade (written answers) ----------------
-  const GS = { mode: 'question', q: 0, stu: 0, tool: 'pen' };
+  // ---------------- Grade (written answers): review and correct the automatic grades ----------------
+  const GS = { mode: 'question', q: 0, stu: 0, tool: 'pen', focus: null };
   async function viewGrade(v) {
     const e = S.exam;
-    v.appendChild(el('h2', {}, 'Grade written answers'));
+    v.appendChild(el('h2', {}, 'Written answers'));
     if (!e.sa.length) { v.appendChild(el('div', { class: 'card' }, 'This exam has no written-response questions.')); return; }
     const studs = S.students.slice().sort((a, b) => a.key - b.key);
     if (!studs.length) { v.appendChild(el('div', { class: 'card' }, 'Scan some exams first.')); return; }
@@ -773,22 +937,45 @@
     v.appendChild(el('div', { class: 'card row wrap stickybar' }, field('Mode', modeSel), field(GS.mode === 'question' ? 'Question' : 'Student', pick), tools, el('span', { id: 'saveState', class: 'muted small' }, 'Autosave on')));
     const aiBox = el('div', { id: 'aiBox' }); v.appendChild(aiBox);
     const list = el('div', { id: 'gradeList' }); v.appendChild(list);
-    modeSel.onchange = () => { if (AIR.running) AIR.stop = true; GS.mode = modeSel.value; go('grade'); };
-    pick.onchange = () => { if (AIR.running) AIR.stop = true; if (GS.mode === 'question') GS.q = +pick.value; else GS.stu = +pick.value; renderList(); };
+    modeSel.onchange = () => { GS.mode = modeSel.value; go('grade'); };
+    pick.onchange = () => { if (GS.mode === 'question') GS.q = +pick.value; else GS.stu = +pick.value; renderList(); };
     let token = 0;
     const renderList = async () => {
       const my = ++token;
       list.innerHTML = '';
       aiBox.innerHTML = '';
-      if (GS.mode === 'question' && S.settings.ai.enabled) aiBox.appendChild(aiBar(e.sa[GS.q], studs, list));
+      aiBox.appendChild(gradeInfoBar(studs));
       const pairs = GS.mode === 'question' ? studs.map(s => [s, e.sa[GS.q]]) : e.sa.map(q => [studs[GS.stu], q]);
       for (const [stu, q] of pairs) {
         const item = await gradeItem(stu, q, studs);
         if (my !== token) return;
         list.appendChild(item);
       }
+      if (GS.focus) {
+        const f = list.querySelector(`.gradeitem[data-stu="${GS.focus.stu}"][data-sa="${GS.focus.sa}"]`);
+        GS.focus = null;
+        if (f) { f.classList.add('focus'); f.scrollIntoView({ block: 'center' }); }
+      }
     };
     await renderList();
+  }
+
+  function gradeInfoBar(studs) {
+    const box = el('div', { class: 'card aibar small', id: 'aiBar' });
+    if (!aiOn()) {
+      box.appendChild(el('p', {}, aiReady() ? 'Automatic AI grading is off (Settings > AI grading). Grade the written answers here.' : 'Written answers are graded by AI automatically once the Apps Script server and AI grading are set up in Settings. Until then, grade them here.'));
+      return box;
+    }
+    box.appendChild(el('p', {}, 'Written answers are graded automatically by AI as drafts (marks and points in red). Change anything you like: your changes mark the item as teacher-graded. Flagged items are listed under Results > Needs attention.'));
+    if (GS.mode === 'question') {
+      const q = S.exam.sa[GS.q];
+      box.appendChild(el('div', { class: 'row wrap' }, el('button', { class: 'btn small', id: 'btnAiRerunQ', onclick: () => {
+        if (!confirm(`Re-run AI on SA${GS.q + 1} for all students? Teacher grades on this question are replaced.`)) return;
+        const n = enqueue(studs.filter(s => saPage(s, q).scan).map(s => [s, q]), true); runQueue(); toast(`${n} answer(s) queued for AI`);
+        go('grade');
+      } }, 'Re-run AI on this question (all students)')));
+    }
+    return box;
   }
 
   async function gradeItem(stu, q, studs, opts = {}) {
@@ -798,7 +985,8 @@
     const g0 = gradeOf(stu);
     const scan = g0.pages[lq.page];
     const card = el('div', { class: 'card gradeitem', 'data-stu': stu.id, 'data-sa': qi + 1 });
-    card.appendChild(el('div', { class: 'row between wrap' }, el('strong', {}, `Student ${studs.indexOf(stu) + 1} ${g0.id ? '(' + g0.id + ')' : ''} ${g0.name || ''} - SA${qi + 1}`), el('span', { class: 'ptsnow muted' }, '')));
+    const badges = el('span', { class: 'row tight wrap badges' });
+    card.appendChild(el('div', { class: 'row between wrap' }, el('strong', {}, `Student ${studs.indexOf(stu) + 1} ${g0.id ? '(' + g0.id + ')' : ''} ${g0.name || ''} - SA${qi + 1}`), el('span', { class: 'row tight wrap' }, badges, el('span', { class: 'ptsnow muted' }, ''))));
     if (!scan) { card.appendChild(el('p', { class: 'warntext' }, `Page ${lq.page} has not been scanned for this student.`)); return card; }
     const im = await imgOf(scan);
     const PX = Layout.PX, R = lq.region;
@@ -807,17 +995,26 @@
     card.appendChild(cv);
     stu.sa = stu.sa || {}; stu.ink = stu.ink || {};
     const sa = stu.sa[q.id] = stu.sa[q.id] || { pts: null, comments: [], note: '' };
-    const pend = stu.aiPending && stu.aiPending[q.id];
-    if (pend) card.classList.add('aipending');
+    const drawBadges = () => {
+      badges.innerHTML = '';
+      const r = gradeOf(stu).sa[q.id];
+      const queued = Q.jobs.some(j => j.stu === stu.id && j.q === q.id);
+      if (queued) badges.appendChild(el('span', { class: 'badge mid srcbadge', 'data-src': 'queued' }, 'Queued for AI'));
+      if (r.pts === null) badges.appendChild(el('span', { class: 'badge bad srcbadge', 'data-src': 'none' }, r.flag === 'error' ? 'AI failed: needs grading' : 'Needs grading'));
+      else badges.appendChild(el('span', { class: 'badge srcbadge' + (r.source === 'ai' ? ' ai' : ''), 'data-src': r.source }, r.source === 'ai' ? 'AI' : 'Teacher'));
+      if (r.flag === 'low') badges.appendChild(el('span', { class: 'badge bad flagbadge' }, 'Low confidence'));
+      if (r.flag === 'illegible') badges.appendChild(el('span', { class: 'badge bad flagbadge' }, 'Illegible or blank'));
+    };
     const redraw = async () => {
       const full = CV.canvasOf(Layout.RW, Layout.RH);
       const g = gradeOf(stu);
       await Annot.renderPage(im, e, lay, g, stu, lq.page, { canvas: full });
       cv.getContext('2d').drawImage(full, R.x * PX, R.y * PX, cv.width, cv.height, 0, 0, cv.width, cv.height);
-      if (stu.aiPending && stu.aiPending[q.id]) AI.drawPending(cv.getContext('2d'), stu.aiPending[q.id].marks, lq, R.x * PX, R.y * PX);
       card.querySelector('.ptsnow').textContent = sa.pts === null || sa.pts === undefined ? 'not graded' : `${U.fmt(sa.pts)} / ${U.fmt(q.max)}`;
+      drawBadges();
     };
-    const save = async () => { await saveStudent(stu); markSaved(); await redraw(); };
+    // every teacher action: teacher-edited, back to Draft if approved
+    const save = async () => { teacherEdit(stu, q.id); await saveStudent(stu); markSaved(); await redraw(); refreshDash(); };
     // pen input
     let cur = null;
     const toPage = ev => {
@@ -872,9 +1069,16 @@
     let nt; note.oninput = () => { sa.note = note.value; clearTimeout(nt); nt = setTimeout(save, 400); };
     const inkTools = el('div', { class: 'row wrap' },
       el('button', { class: 'btn small', onclick: async () => { const ink = stu.ink[lq.page] || []; for (let i = ink.length - 1; i >= 0; i--) if (ink[i].q === q.id) { ink.splice(i, 1); break; } await save(); } }, 'Undo ink'),
-      el('button', { class: 'btn small', onclick: async () => { if (!confirm('Clear all ink on this answer?')) return; stu.ink[lq.page] = (stu.ink[lq.page] || []).filter(k => k.q !== q.id); await save(); } }, 'Clear ink'));
-    if (pend) card.appendChild(pendingPanel(stu, q, pend, card, studs));
-    if (opts.edited) card.appendChild(el('p', { class: 'small muted aieditnote' }, 'AI suggestion applied. Adjust the points, comments or ink below.'));
+      el('button', { class: 'btn small', onclick: async () => { if (!confirm('Clear all ink on this answer?')) return; stu.ink[lq.page] = (stu.ink[lq.page] || []).filter(k => k.q !== q.id); await save(); } }, 'Clear ink'),
+      aiReady() ? el('button', { class: 'btn small airerun', onclick: async () => {
+        enqueue([[stu, q]], true); await runQueue(); drawBadges(); toast('Queued for AI');
+      } }, 'Re-run AI on this question') : null);
+    if (sa.source === 'ai' && sa.aiRes) {
+      const a = sa.aiRes;
+      card.appendChild(el('div', { class: 'aipanel small', 'data-conf': a.confidence },
+        el('div', {}, el('strong', {}, `AI draft: ${U.fmt(sa.pts)} / ${U.fmt(q.max)}`), ` (${a.legible === false ? 'illegible or blank' : a.confidence + ' confidence'}${a.model ? ', ' + a.model : ''})`),
+        (a.rubricItems || []).length ? el('ul', { class: 'rubriclist' }, a.rubricItems.map(r => el('li', {}, `${r.item}: ${U.fmt(r.earned)} / ${U.fmt(r.max)}`))) : null));
+    }
     card.appendChild(el('div', { class: 'label small muted' }, 'Points'));
     card.appendChild(ptsRow);
     card.appendChild(chips);
@@ -884,11 +1088,20 @@
     return card;
   }
 
-  // ---------------- AI suggestions (Gemini through the Apps Script server) ----------------
-  const AIR = { running: false, stop: false };
+  // ---------------- Automatic AI grading queue (Gemini through the Apps Script server) ----------------
+  // Runs in the background across views; its job list is stored so it resumes after a reload.
+  const Q = { examId: null, jobs: [], total: 0, done: 0, running: false, pause: false, msg: '', blocked: '', finished: '' };
   function aiReady() { const st = S.settings; return !!(st.cloudUrl && st.cloudToken); }
+  function aiOn() { return !!(S.settings.ai && S.settings.ai.enabled && aiReady()); }
   function presetsOf(q) { return Array.from(new Set([...(q.comments || []), ...(S.exam.comments || [])])); }
   function saPage(stu, q) { const lq = L().sa.find(s => s.qid === q.id); return { lq, scan: lq ? gradeOf(stu).pages[lq.page] : null }; }
+  function isTeacher(g) { return !!g && g.pts !== null && g.pts !== undefined && g.pts !== '' && (g.source === 'teacher' || (!g.source && g.ai !== 'accepted')); }
+  function needsAI(stu, q) {
+    const g = stu.sa && stu.sa[q.id];
+    if (g && g.pts !== null && g.pts !== undefined && g.pts !== '') return false;   // graded (AI or teacher)
+    if (g && g.flag === 'error') return false;                                        // AI failed: the teacher grades it
+    return !!saPage(stu, q).scan;
+  }
   async function rerenderCard(stu, q, studs, opts = {}) {
     const old = document.querySelector(`.gradeitem[data-stu="${stu.id}"][data-sa="${S.exam.sa.indexOf(q) + 1}"]`);
     if (!old) return null;
@@ -897,178 +1110,411 @@
     return n;
   }
 
-  function pendingPanel(stu, q, p, card, studs) {
-    const flags = [];
-    if (!p.legible) flags.push(el('span', { class: 'badge bad' }, 'Illegible or blank'));
-    if (p.confidence !== 'high') flags.push(el('span', { class: 'badge ' + (p.confidence === 'low' ? 'bad' : 'mid') }, p.confidence + ' confidence'));
-    else flags.push(el('span', { class: 'badge' }, 'high confidence'));
-    return el('div', { class: 'aipanel', 'data-conf': p.confidence },
-      el('div', { class: 'row wrap' }, el('strong', {}, `AI suggestion: ${U.fmt(p.points)} / ${U.fmt(q.max)}`), flags, el('span', { class: 'muted small' }, 'Pending, not counted until accepted')),
-      (p.rubricItems || []).length ? el('ul', { class: 'rubriclist small' }, p.rubricItems.map(r => el('li', {}, `${r.item}: ${U.fmt(r.earned)} / ${U.fmt(r.max)}`))) : null,
-      p.comment ? el('div', { class: 'small' }, 'Comment: ', el('em', {}, p.comment)) : null,
-      el('div', { class: 'row wrap' },
-        el('button', { class: 'btn small primary aiaccept', onclick: () => applySuggestion(stu, q, studs, 'accepted') }, 'Accept'),
-        el('button', { class: 'btn small aiedit', onclick: () => applySuggestion(stu, q, studs, 'edited') }, 'Edit'),
-        el('button', { class: 'btn small danger aireject', onclick: async () => { delete stu.aiPending[q.id]; await saveStudent(stu); await rerenderCard(stu, q, studs); } }, 'Reject')));
+  async function loadQueue() {
+    if (!S.exam) return;
+    const d = await DB.getKV('aiq:' + S.exam.id, null);
+    Object.assign(Q, { examId: S.exam.id, jobs: (d && d.jobs) || [], total: (d && d.total) || 0, done: (d && d.done) || 0, pause: false, msg: '', blocked: '', finished: '' });
+    if (!Q.jobs.length) { Q.total = 0; Q.done = 0; }
+    renderQ();
+    if (Q.jobs.length) runQueue();
+  }
+  function persistQ() { if (Q.examId) return DB.setKV('aiq:' + Q.examId, { jobs: Q.jobs, total: Q.total, done: Q.done }); }
+  function enqueue(pairs, force) {
+    if (!S.exam || Q.examId !== S.exam.id) return 0;
+    let n = 0;
+    if (!Q.jobs.length) { Q.total = 0; Q.done = 0; }
+    for (const [stu, q] of pairs) {
+      const ex = Q.jobs.find(j => j.stu === stu.id && j.q === q.id);
+      if (ex) { if (force) ex.force = true; continue; }
+      Q.jobs.push({ stu: stu.id, q: q.id, force: !!force, n: 0 }); n++;
+    }
+    Q.total += n; Q.finished = '';
+    persistQ(); renderQ();
+    return n;
+  }
+  function dropJob(stuId, qid) {
+    const i = Q.jobs.findIndex(j => j.stu === stuId && j.q === qid);
+    if (i > 0 || (i === 0 && !Q.inflight)) { Q.jobs.splice(i, 1); Q.total = Math.max(Q.done, Q.total - 1); persistQ(); renderQ(); }
+    else if (i === 0) Q.jobs[0].cancel = true;
+  }
+  function enqueueMissing() {
+    if (!aiOn() || !S.exam) return 0;
+    const pairs = [];
+    S.students.forEach(stu => S.exam.sa.forEach(q => { if (needsAI(stu, q)) pairs.push([stu, q]); }));
+    const n = enqueue(pairs, false);
+    runQueue();
+    return n;
   }
 
-  // Accept: points + comment + marks become normal teacher annotations. Edit: the same, then the teacher adjusts.
-  async function applySuggestion(stu, q, studs, mode, rerender = true) {
-    const p = stu.aiPending && stu.aiPending[q.id]; if (!p) return;
-    const { lq } = saPage(stu, q);
-    stu.sa = stu.sa || {}; stu.ink = stu.ink || {};
-    const sa = stu.sa[q.id] = stu.sa[q.id] || { pts: null, comments: [], note: '' };
-    sa.pts = Math.max(0, Math.min(+q.max || 0, Math.round((+p.points || 0) * 2) / 2));
-    const c = String(p.comment || '').trim();
-    if (c) {
-      if (presetsOf(q).includes(c)) { if (!sa.comments.includes(c)) sa.comments = [...sa.comments, c]; }
-      else sa.note = sa.note ? sa.note + '; ' + c : c;
+  function renderQ() {
+    const box = $('#aiq'); if (!box) return;
+    box.innerHTML = '';
+    const active = Q.jobs.length > 0;
+    if (!active && !Q.finished) { box.classList.add('hidden'); return; }
+    box.classList.remove('hidden');
+    if (!active) {
+      box.appendChild(el('div', { class: 'aiqrow' }, el('span', { id: 'aiqText' }, Q.finished),
+        el('button', { class: 'btn small', onclick: () => go('results') }, 'Results'),
+        el('button', { class: 'btn small', id: 'aiqHide', onclick: () => { Q.finished = ''; renderQ(); } }, 'Hide')));
+      return;
     }
-    const ink = stu.ink[lq.page] = stu.ink[lq.page] || [];
-    ink.push(...AI.toInk(p.marks, lq, q.id));
-    sa.ai = mode; sa.aiModel = p.model || '';
-    delete stu.aiPending[q.id];
-    await saveStudent(stu);
-    if (!rerender) return;
-    const n = await rerenderCard(stu, q, studs, { edited: mode === 'edited' });
-    if (n && mode === 'edited') { n.scrollIntoView({ block: 'center' }); const ni = n.querySelector('input.note'); if (ni) ni.focus(); }
+    const why = !aiOn() ? 'paused: AI grading is off or the server is not set up (Settings)' : Q.blocked ? Q.blocked : Q.pause ? 'paused' : Q.msg;
+    box.appendChild(el('div', { class: 'aiqrow' },
+      el('span', { id: 'aiqText' }, `AI grading written answers: ${Q.done} of ${Q.total}`),
+      el('progress', { id: 'aiqProg', max: Math.max(1, Q.total), value: Q.done }),
+      el('span', { class: 'small aiqmsg', id: 'aiqMsg' }, why || ''),
+      (Q.pause || Q.blocked) ? el('button', { class: 'btn small', id: 'aiqResume', onclick: () => { Q.pause = false; Q.blocked = ''; renderQ(); runQueue(); } }, 'Resume')
+        : el('button', { class: 'btn small', id: 'aiqPause', onclick: () => { Q.pause = true; Q.msg = 'Pausing after the current answer...'; renderQ(); } }, 'Pause')));
   }
+  const setQ = t => { Q.msg = t; const m = $('#aiqMsg'); if (m && !Q.blocked && !Q.pause) m.textContent = t; };
 
-  function aiBar(q, studs, list) {
-    const st = S.settings, ai = st.ai;
-    const box = el('div', { class: 'card aibar', id: 'aiBar' });
-    if (!aiReady()) { box.appendChild(el('p', { class: 'small' }, 'AI suggestions need the Apps Script URL and token in Settings > Google Drive / Sheets.')); return box; }
-    const prog = el('progress', { id: 'aiProg', max: 1, value: 0 });
-    const msg = el('span', { id: 'aiMsg', class: 'small' }, `Model: ${AI.modelOf(ai) || 'automatic'}. Up to ${ai.rpm} requests per minute.`);
-    const btnRun = el('button', { class: 'btn primary', id: 'btnAiSuggest' }, 'Suggest grades (AI)');
-    const btnStop = el('button', { class: 'btn danger', id: 'btnAiStop', disabled: true, onclick: () => { AIR.stop = true; msg.textContent = 'Stopping after the current answer...'; } }, 'Stop');
-    const btnAll = el('button', { class: 'btn', id: 'btnAiAcceptHigh', onclick: async () => {
-      let n = 0;
-      for (const stu of studs) { const p = stu.aiPending && stu.aiPending[q.id]; if (p && p.confidence === 'high' && p.legible) { await applySuggestion(stu, q, studs, 'accepted', false); n++; } }
-      for (const stu of studs) await rerenderCard(stu, q, studs);
-      toast(`${n} high-confidence suggestion(s) accepted`, 'good');
-    } }, 'Accept all high-confidence');
-    btnRun.onclick = () => runSuggest(q, studs, { prog, msg, btnRun, btnStop }).catch(err => { msg.textContent = 'Error: ' + err.message; });
-    box.appendChild(el('div', { class: 'row wrap' }, btnRun, btnStop, btnAll, prog, msg));
-    box.appendChild(el('p', { class: 'small muted' }, 'Only the cropped answer box is sent (no name or ID). Suggestions are pending until you accept them.'));
-    return box;
-  }
-
-  async function runSuggest(q, studs, ui) {
-    if (AIR.running) return;
-    const st = S.settings, ai = st.ai;
-    const { prog, msg, btnRun, btnStop } = ui;
-    const setMsg = t => { msg.textContent = t; };
-    if (!ai.models.length && !ai.model) {
-      setMsg('Loading models...');
-      const r = await AI.post(st.cloudUrl, st.cloudToken, { action: 'aiModels' });
-      if (!r.ok) { setMsg('Could not load models: ' + r.error); return; }
-      ai.models = r.models; await saveSettings();
-    }
-    const model = AI.modelOf(ai);
-    if (!model) { setMsg('No Gemini model available.'); return; }
-    // teacher-graded examples of this question (teacher's own grades first), up to 4
-    const graded = studs.filter(s => s.sa && s.sa[q.id] && s.sa[q.id].pts !== null && s.sa[q.id].pts !== undefined && saPage(s, q).scan)
-      .sort((a, b) => (!!a.sa[q.id].ai - !!b.sa[q.id].ai));
-    const examples = [];
-    for (const s of graded.slice(0, 4)) {
-      const { lq, scan } = saPage(s, q);
-      const g = s.sa[q.id];
-      examples.push({ imageB64: AI.boxCrop(await imgOf(scan), lq).b64, points: g.pts, comment: [...(g.comments || []), g.note || ''].map(t => String(t).trim()).filter(Boolean).join('; ') });
-    }
-    const todo = studs.filter(s => { const g = s.sa && s.sa[q.id]; return (!g || g.pts === null || g.pts === undefined) && !(s.aiPending && s.aiPending[q.id]) && saPage(s, q).scan; });
-    if (!todo.length) { setMsg('No ungraded answers left for this question.'); return; }
-    AIR.running = true; AIR.stop = false;
-    btnRun.disabled = true; btnStop.disabled = false;
-    prog.max = todo.length; prog.value = 0;
-    const cap = Math.max(1, +ai.dailyCap || AI.DEFAULTS.dailyCap);
-    let done = 0, errors = 0, warned = false, why = '';
-    const retries = new Map();
+  async function runQueue() {
+    if (Q.running || !Q.jobs.length || !aiOn() || Q.pause || Q.blocked) { renderQ(); return; }
+    const st = S.settings, ai = st.ai, examId = Q.examId;
+    Q.running = true;
+    let errorsInRow = 0;
+    const studs = () => S.students.slice().sort((a, b) => a.key - b.key);
     try {
-      for (let i = 0; i < todo.length; i++) {
-        if (AIR.stop) { why = 'Stopped.'; break; }
-        const stu = todo[i];
+      if (!ai.models.length && !ai.model) {
+        setQ('Loading models...');
+        const r = await AI.post(st.cloudUrl, st.cloudToken, { action: 'aiModels' });
+        if (!r.ok) { Q.blocked = 'Could not load models: ' + r.error; return; }
+        ai.models = r.models; await saveSettings();
+      }
+      const model = AI.modelOf(ai);
+      if (!model) { Q.blocked = 'No Gemini model available.'; return; }
+      const cap = () => Math.max(1, +ai.dailyCap || AI.DEFAULTS.dailyCap);
+      let warned = false;
+      const retries = new Map();
+      while (Q.jobs.length && !Q.pause && aiOn() && S.exam && S.exam.id === examId) {
+        const job = Q.jobs[0];
+        const stu = S.students.find(s => s.id === job.stu), q = S.exam.sa.find(x => x.id === job.q);
+        const skip = () => { Q.jobs.shift(); Q.total = Math.max(Q.done, Q.total - 1); persistQ(); renderQ(); };
+        if (!stu || !q || !saPage(stu, q).scan || (!job.force && !needsAI(stu, q))) { skip(); continue; }
         const used = await AI.today();
-        if (used >= cap) { why = `Daily limit reached (${used} of ${cap} requests today). Stopped; continue tomorrow or raise the limit in Settings.`; break; }
-        if (used >= cap - AI.WARN_MARGIN && !warned) { warned = true; toast(`AI requests today: ${used} of ${cap}. Close to the daily limit.`, 'bad'); }
-        const go_ = await AI.pace(ai.rpm, () => AIR.stop, w => setMsg(`Answer ${i + 1} of ${todo.length}: waiting ${Math.ceil(w / 1000)} s (pacing)`));
-        if (!go_) { why = 'Stopped.'; break; }
-        setMsg(`Answer ${i + 1} of ${todo.length}: asking ${model}...`);
+        if (used >= cap()) { Q.blocked = `Daily limit reached (${used} of ${cap()} requests today). Raise it in Settings or resume tomorrow.`; break; }
+        if (used >= cap() - AI.WARN_MARGIN && !warned) { warned = true; toast(`AI requests today: ${used} of ${cap()}. Close to the daily limit.`, 'bad'); }
+        const ok = await AI.pace(ai.rpm, () => Q.pause || !aiOn(), w => setQ(`waiting ${Math.ceil(w / 1000)} s (pacing)`));
+        if (!ok) break;
+        setQ(`asking ${model}...`);
         const { lq, scan } = saPage(stu, q);
         const crop = AI.boxCrop(await imgOf(scan), lq);
+        const keyImg = S.exam.keyScan && S.exam.keyScan.sa && S.exam.keyScan.sa[q.id];
         await AI.bump();
+        Q.inflight = true;
         let r;
         try {
           r = await AI.post(st.cloudUrl, st.cloudToken, {
             action: 'aiGrade', model, prompt: q.prompt || '', maxPoints: +q.max || 0, answerKey: q.modelAnswer || q.key || '', rubric: q.rubric || '',
-            presetComments: presetsOf(q), examples, imageB64: crop.b64
+            presetComments: presetsOf(q), examples: [], imageB64: crop.b64, keyImageB64: keyImg ? keyImg.b64 : undefined
           });
         } catch (err) { r = { ok: false, error: 'Network error: ' + err.message }; }
+        finally { Q.inflight = false; }
+        if (!S.exam || S.exam.id !== examId) break;
         if (!r.ok && r.rateLimited) {
-          if (r.dailyQuota) { why = 'Google reports the daily free quota is used up. Stopped; try again tomorrow.'; break; }
-          retries.set(stu.id, (retries.get(stu.id) || 0) + 1);
-          if (retries.get(stu.id) > 4) { why = 'Still rate limited after several pauses. Stopped.'; break; }
+          if (r.dailyQuota) { Q.blocked = 'Google reports the daily free quota is used up. Resume tomorrow.'; break; }
+          retries.set(job, (retries.get(job) || 0) + 1);
+          if (retries.get(job) > 4) { Q.blocked = 'Still rate limited after several pauses.'; break; }
           const secs = Math.min(120, Math.max(2, +r.retryAfter || 30));
           const until = Date.now() + secs * 1000;
-          while (Date.now() < until && !AIR.stop) { setMsg(`Rate limited by Google. Paused, resuming in ${Math.ceil((until - Date.now()) / 1000)} s`); await U.sleep(250); }
+          while (Date.now() < until && !Q.pause) { setQ(`rate limited by Google, resuming in ${Math.ceil((until - Date.now()) / 1000)} s`); await U.sleep(250); }
           AI.resetPace();
-          i--; continue;
-        }
-        if (!r.ok) {
-          errors++;
-          setMsg(`Answer ${i + 1}: ${r.error}`);
-          if (errors >= 3) { why = 'Stopped after 3 errors: ' + r.error; break; }
           continue;
         }
-        stu.aiPending = stu.aiPending || {};
-        stu.aiPending[q.id] = { ...r.result, model, at: Date.now() };
-        await saveStudent(stu);
-        await rerenderCard(stu, q, studs);
-        done++; prog.value = done;
+        if (job.cancel) { skip(); continue; }   // the teacher graded it meanwhile
+        if (!r.ok) {
+          errorsInRow++; job.n = (job.n || 0) + 1;
+          setQ(`error: ${r.error}`);
+          Q.jobs.shift();
+          if (job.n >= 3) {
+            stu.sa = stu.sa || {};
+            const sa = stu.sa[q.id] = stu.sa[q.id] || { pts: null, comments: [], note: '' };
+            if (sa.pts === null || sa.pts === undefined) { sa.flag = 'error'; sa.aiError = r.error; await saveStudent(stu); }
+            Q.done++;
+          } else Q.jobs.push(job);
+          persistQ(); renderQ();
+          if (errorsInRow >= 5) { Q.blocked = 'Stopped after repeated errors: ' + r.error; break; }
+          continue;
+        }
+        errorsInRow = 0;
+        await applyAI(stu, q, { ...r.result, model }, lq);
+        Q.jobs.shift(); Q.done++;
+        await persistQ();
+        renderQ();
+        if (S.view === 'grade') await rerenderCard(stu, q, studs());
+        refreshDash();
+        if (!Q.jobs.some(j => j.stu === stu.id)) autoApproveSoon([stu]);
       }
     } finally {
-      AIR.running = false; AIR.stop = false;
-      btnRun.disabled = false; btnStop.disabled = true;
+      Q.running = false;
+      if (!Q.jobs.length && Q.total) {
+        const flagged = S.students.reduce((a, s) => a + gradeOf(s).saFlags, 0);
+        Q.finished = `AI grading finished: ${Q.done} answer(s) graded${flagged ? `, ${flagged} flagged for attention` : ''}.`;
+        Q.total = 0; Q.done = 0; persistQ();
+        refreshDash();
+      }
+      renderQ();
     }
-    setMsg(`${done} suggestion(s) ready${errors ? `, ${errors} error(s)` : ''}. ${why} Requests today: ${await AI.today()} of ${cap}.`.replace(/\s+/g, ' ').trim());
+  }
+
+  // AI result -> draft grade with red-pen annotations (points in the score box, comment, check/cross/circle/underline)
+  async function applyAI(stu, q, p, lq) {
+    stu.sa = stu.sa || {}; stu.ink = stu.ink || {};
+    const sa = stu.sa[q.id] = { pts: null, comments: [], note: '' };
+    sa.pts = Math.max(0, Math.min(+q.max || 0, Math.round((+p.points || 0) * 2) / 2));
+    const c = String(p.comment || '').trim();
+    if (c) { if (presetsOf(q).includes(c)) sa.comments = [c]; else sa.note = c; }
+    sa.source = 'ai'; sa.edited = false;
+    sa.aiRes = { points: p.points, rubricItems: p.rubricItems || [], comment: c, legible: p.legible !== false, confidence: p.confidence, model: p.model || '', at: Date.now() };
+    if (p.legible === false) { sa.pts = 0; sa.flag = 'illegible'; }
+    else if (p.confidence === 'low') sa.flag = 'low';
+    const ink = stu.ink[lq.page] = (stu.ink[lq.page] || []).filter(k => !(k.ai && k.q === q.id));
+    ink.push(...AI.toInk(p.marks, lq, q.id));
+    markDraft(stu);
+    await saveStudent(stu);
   }
 
   // ---------------- Results / preview / export ----------------
   async function viewResults(v) {
-    const e = S.exam, lay = L();
-    const studs = S.students.slice();
-    const graded = studs.map(s => ({ stu: s, g: gradeOf(s) })).sort((a, b) => Grade.sortKey(a.g).localeCompare(Grade.sortKey(b.g)));
     v.appendChild(el('h2', {}, 'Results'));
-    if (!graded.length) { v.appendChild(el('div', { class: 'card' }, 'No students scanned yet.')); return; }
+    if (!S.students.length) { v.appendChild(el('div', { class: 'card' }, 'No students scanned yet.')); return; }
+    v.appendChild(el('div', { id: 'dashWrap' }));
+    v.appendChild(el('div', { class: 'card', id: 'approveCard' },
+      el('h3', {}, 'Approve'),
+      el('p', { class: 'small muted' }, 'Approving generates each student\'s marked PDF, the combined class PDF and the Excel and CSV gradebooks' + (aiReady() ? ', and saves them to Google Drive / Sheets.' : '. Set up the Google server in Settings to save them to Drive automatically.')),
+      el('div', { class: 'row wrap' },
+        el('button', { class: 'btn primary', id: 'btnApproveAll', onclick: () => approveStudents(S.students.filter(s => s.status !== 'approved')) }, 'Approve all'),
+        el('span', { id: 'approveProgress', class: 'small muted' }, GEN.progress || '')),
+      el('div', { id: 'approveSummary' })));
+    const ex = el('div', { class: 'card' }, el('h3', {}, 'Export now (any status)'),
+      el('div', { class: 'row wrap' },
+        el('button', { class: 'btn', id: 'btnCombined', onclick: () => exportCombined(sortedGraded()) }, 'Combined class PDF'),
+        el('button', { class: 'btn', id: 'btnAllPdfs', onclick: () => exportAll(sortedGraded()) }, 'All student PDFs'),
+        el('button', { class: 'btn', id: 'btnCsv', onclick: () => exportCSV(sortedGraded()) }, 'CSV gradebook'),
+        el('button', { class: 'btn', id: 'btnXlsx', onclick: () => exportXLSX(sortedGraded()) }, 'Excel gradebook'),
+        el('button', { class: 'btn', id: 'btnCloud', onclick: () => cloudSave(sortedGraded()) }, 'Save to Google Drive')),
+      el('div', { id: 'exportProgress', class: 'small muted' }));
+    v.appendChild(ex);
+    v.appendChild(el('div', { id: 'previewBox' }));
+    renderDash();
+    await renderApproveSummary();
+  }
+  function sortedGraded() {
+    return S.students.map(s => ({ stu: s, g: gradeOf(s) })).sort((a, b) => Grade.sortKey(a.g).localeCompare(Grade.sortKey(b.g)));
+  }
+  const refreshDash = (() => { let t; return () => { if (S.view !== 'results') return; clearTimeout(t); t = setTimeout(renderDash, 250); }; })();
+
+  function renderDash() {
+    const box = $('#dashWrap'); if (!box) return;
+    const e = S.exam;
+    const graded = sortedGraded();
+    const studs = S.students.slice().sort((a, b) => a.key - b.key);
+    box.innerHTML = '';
     const tot = graded.map(x => x.g.pct).sort((a, b) => a - b);
     const mean = tot.reduce((a, b) => a + b, 0) / tot.length;
     const med = tot.length % 2 ? tot[(tot.length - 1) / 2] : (tot[tot.length / 2 - 1] + tot[tot.length / 2]) / 2;
-    const incomplete = graded.filter(x => !x.g.complete).length;
-    v.appendChild(el('div', { class: 'card stats' },
+    const nApproved = graded.filter(x => x.g.approved).length;
+    const nAttn = graded.filter(x => x.g.attention).length;
+    box.appendChild(el('div', { class: 'card stats' },
       stat('Students', graded.length), stat('Mean', U.fmt(mean) + '%'), stat('Median', U.fmt(med) + '%'),
-      stat('High', U.fmt(tot[tot.length - 1]) + '%'), stat('Low', U.fmt(tot[0]) + '%'), stat('Incomplete', incomplete)));
-    const ex = el('div', { class: 'card' }, el('h3', {}, 'Export'),
-      el('div', { class: 'row wrap' },
-        el('button', { class: 'btn primary', id: 'btnCombined', onclick: () => exportCombined(graded) }, 'Combined class PDF'),
-        el('button', { class: 'btn', id: 'btnAllPdfs', onclick: () => exportAll(graded) }, 'All student PDFs'),
-        el('button', { class: 'btn', id: 'btnCsv', onclick: () => exportCSV(graded) }, 'CSV gradebook'),
-        el('button', { class: 'btn', id: 'btnXlsx', onclick: () => exportXLSX(graded) }, 'Excel gradebook'),
-        el('button', { class: 'btn', id: 'btnCloud', onclick: () => cloudSave(graded) }, 'Save to Google Drive')),
-      el('div', { id: 'exportProgress', class: 'small muted' }),
-      incomplete ? el('p', { class: 'warntext small' }, `${incomplete} student(s) are not completely graded; their status is shown in the gradebook.`) : null);
-    v.appendChild(ex);
+      stat('High', U.fmt(tot[tot.length - 1]) + '%'), stat('Low', U.fmt(tot[0]) + '%'), stat('Need attention', nAttn), stat('Approved', `${nApproved} / ${graded.length}`)));
+    // needs attention
+    const items = [];
+    graded.forEach(({ stu, g }) => {
+      const n = studs.indexOf(stu) + 1, who = `Student ${n}${g.id ? ' (' + g.id + ')' : ''}${g.name ? ' ' + g.name : ''}`;
+      if (!g.idOk) items.push({ who, what: 'student ID needs checking', kind: 'id', open: () => go('review') });
+      if (g.missing.length) items.push({ who, what: `missing page ${g.missing.join(', ')}`, kind: 'page', open: () => go('scan') });
+      if (g.dups) items.push({ who, what: `${g.dups} duplicate page(s)`, kind: 'page', open: () => go('scan') });
+      e.mc.forEach((q, i) => { const r = g.mc[q.id]; if (r.state === 'review') items.push({ who, what: `Q${i + 1}: unclear bubble`, kind: 'mc', open: () => go('review') }); });
+      e.sa.forEach((q, i) => {
+        const r = g.sa[q.id];
+        const queued = Q.jobs.some(j => j.stu === stu.id && j.q === q.id);
+        const open = () => { GS.mode = 'question'; GS.q = i; GS.focus = { stu: stu.id, sa: i + 1 }; go('grade'); };
+        if (r.flag === 'low') items.push({ who, what: `SA${i + 1}: low AI confidence (draft ${U.fmt(r.pts)} / ${U.fmt(q.max)})`, kind: 'sa', sa: i + 1, stu: stu.id, open });
+        else if (r.flag === 'illegible') items.push({ who, what: `SA${i + 1}: illegible or blank (draft 0 / ${U.fmt(q.max)})`, kind: 'sa', sa: i + 1, stu: stu.id, open });
+        else if (r.pts === null && !queued && saPage(stu, q).scan) items.push({ who, what: `SA${i + 1}: ${r.flag === 'error' ? 'AI failed, needs grading' : 'needs grading'}`, kind: 'sa', sa: i + 1, stu: stu.id, open });
+      });
+    });
+    box.appendChild(el('div', { class: 'card' + (items.length ? ' warn' : ' ok'), id: 'attention' },
+      el('h3', {}, `Needs attention (${items.length})`),
+      items.length ? el('ul', { class: 'attnlist', id: 'attentionList' }, items.slice(0, 200).map(it => el('li', { class: 'attn ' + it.kind, 'data-stu': it.stu || '', 'data-sa': it.sa || '' },
+        el('span', {}, el('strong', {}, it.who), ': ' + it.what), el('button', { class: 'btn small', onclick: it.open }, 'Open'))))
+        : el('p', { class: 'small' }, Q.jobs.length ? 'Nothing flagged so far; AI grading is still running.' : 'Nothing flagged. Review anything you like, or approve.')));
+    // dashboard table
     const tbl = el('table', { class: 'gradebook', id: 'gradebook' },
-      el('thead', {}, el('tr', {}, ['#', 'ID', 'Name', 'MC', 'Written', 'Total', '%', 'Status', ''].map(h => el('th', {}, h)))),
-      el('tbody', {}, graded.map((x, i) => el('tr', { 'data-stu': x.stu.id },
-        el('td', {}, i + 1), el('td', {}, x.g.id), el('td', {}, x.g.name),
-        el('td', {}, `${U.fmt(x.g.mcTotal)}/${U.fmt(x.g.mcMax)}`), el('td', {}, `${U.fmt(x.g.saTotal)}/${U.fmt(x.g.saMax)}`),
-        el('td', {}, `${U.fmt(x.g.total)}/${U.fmt(x.g.max)}`), el('td', {}, U.fmt(x.g.pct)),
-        el('td', { class: x.g.complete ? 'okc' : 'badc' }, x.g.status),
-        el('td', {}, el('div', { class: 'row tight' },
-          el('button', { class: 'btn small', onclick: () => preview(x.stu) }, 'View'),
-          el('button', { class: 'btn small', onclick: () => exportStudent(x.stu) }, 'PDF')))))));
-    v.appendChild(el('div', { class: 'card scrollx' }, tbl));
-    v.appendChild(el('div', { id: 'previewBox' }));
+      el('thead', {}, el('tr', {}, ['#', 'ID', 'Name', 'MC', 'Written', 'Total', '%', 'Flags', 'Status', ...e.sa.map((q, i) => 'SA' + (i + 1)), ''].map(h => el('th', {}, h)))),
+      el('tbody', {}, graded.map((x, i) => {
+        const g = x.g;
+        return el('tr', { 'data-stu': x.stu.id, 'data-status': g.approval },
+          el('td', {}, i + 1), el('td', {}, g.id), el('td', {}, g.name),
+          el('td', {}, `${U.fmt(g.mcTotal)}/${U.fmt(g.mcMax)}`), el('td', {}, `${U.fmt(g.saTotal)}/${U.fmt(g.saMax)}`),
+          el('td', {}, `${U.fmt(g.total)}/${U.fmt(g.max)}`), el('td', {}, U.fmt(g.pct)),
+          el('td', { class: 'flags ' + (g.attention ? 'badc' : 'okc'), title: g.status }, String(g.attention)),
+          el('td', { class: 'status ' + (g.approved ? 'okc' : '') }, g.approval),
+          e.sa.map((q, k) => {
+            const r = g.sa[q.id];
+            const queued = Q.jobs.some(j => j.stu === x.stu.id && j.q === q.id);
+            const label = queued ? 'Queued' : r.pts === null ? 'Ungraded' : (r.source === 'ai' ? 'AI' : 'Teacher');
+            return el('td', { class: 'src', 'data-sa': k + 1 }, el('button', { class: 'linkbtn srcbtn ' + label.toLowerCase(), title: 'Open this answer', onclick: () => { GS.mode = 'question'; GS.q = k; GS.focus = { stu: x.stu.id, sa: k + 1 }; go('grade'); } }, label + (r.pts !== null ? ' ' + U.fmt(r.pts) : '') + (r.flag && r.pts !== null ? ' !' : '')));
+          }),
+          el('td', {}, el('div', { class: 'row tight' },
+            el('button', { class: 'btn small', onclick: () => preview(x.stu) }, 'View'),
+            e.sa.length ? el('button', { class: 'btn small', onclick: () => { GS.mode = 'student'; GS.stu = studs.indexOf(x.stu); go('grade'); } }, 'Open') : null,
+            el('button', { class: 'btn small', onclick: () => exportStudent(x.stu) }, 'PDF'),
+            g.approved ? el('button', { class: 'btn small btnreopen', title: 'Set back to Draft (not auto-approved again)', onclick: async () => { markDraft(x.stu); x.stu.held = true; await saveStudent(x.stu); renderDash(); } }, 'Reopen')
+              : el('button', { class: 'btn small primary btnapprove', onclick: () => approveStudents([x.stu]) }, 'Approve'))));
+      })));
+    box.appendChild(el('div', { class: 'card scrollx' }, tbl));
+  }
+
+  // ---------------- Approval: Draft -> Approved, then automatic PDFs, gradebooks and Drive saving ----------------
+  const GEN = { chain: Promise.resolve(), progress: '', busy: 0 };
+  const PAGECACHE = new Map();   // student id -> { stamp, urls: [jpeg data URLs] } (memory only)
+  const AUTO = { set: new Set(), t: null };
+  function autoApproveSoon(list) {
+    if (!S.settings.autoApprove || !S.exam) return;
+    (list || []).forEach(s => AUTO.set.add(s.id));
+    clearTimeout(AUTO.t);
+    AUTO.t = setTimeout(() => {
+      const ids = AUTO.set; AUTO.set = new Set();
+      const ok = S.students.filter(s => ids.has(s.id) && s.status !== 'approved' && !s.held && !Q.jobs.some(j => j.stu === s.id) && gradeOf(s).attention === 0);
+      if (ok.length) approveStudents(ok, true);
+    }, 700);
+  }
+
+  async function approveStudents(list, auto = false) {
+    GEN.busy++;
+    try { return await approveInner(list, auto); } finally { GEN.busy--; }
+  }
+  async function approveInner(list, auto) {
+    const busy = list.filter(s => Q.jobs.some(j => j.stu === s.id));
+    const ok = list.filter(s => !busy.includes(s));
+    if (busy.length) toast(`${busy.length} student(s) are still being graded by AI; approve them when it finishes.`, 'bad');
+    if (!ok.length) { if (!busy.length) toast('Everyone is already approved.'); return; }
+    const now = Date.now();
+    for (const s of ok) { s.status = 'approved'; s.approvedAt = now; delete s.held; await saveStudent(s); }
+    toast(`${ok.length} student(s) ${auto ? 'auto-' : ''}approved. Generating PDFs and gradebooks...`, 'good');
+    renderDash();
+    return generateOutputs();
+  }
+
+  function outKey() { return 'out:' + S.exam.id; }
+  async function loadOut() { return (await DB.getKV(outKey(), null)) || { students: {}, examId: S.exam.id }; }
+
+  // serialized: approvals during a run trigger another run afterwards
+  function generateOutputs() {
+    const examId = S.exam.id;
+    GEN.chain = GEN.chain.then(() => (S.exam && S.exam.id === examId ? doGenerate() : null)).catch(err => { console.error(err); toast('Generating outputs failed: ' + err.message, 'bad'); setGen(''); });
+    return GEN.chain;
+  }
+  function setGen(t) { GEN.progress = t; const p = $('#approveProgress'); if (p) p.textContent = t; }
+
+  async function studentUrls(stu) {
+    const c = PAGECACHE.get(stu.id);
+    if (c && c.stamp === stu.approvedAt) return c.urls;
+    const r = await renderStudentPages(stu, 1);
+    const urls = r.pages.map(cv => cv.toDataURL('image/jpeg', 0.86));
+    PAGECACHE.set(stu.id, { stamp: stu.approvedAt, urls });
+    return urls;
+  }
+
+  async function doGenerate() {
+    const e = S.exam, st = S.settings;
+    const graded = sortedGraded().filter(x => x.g.approved);
+    const out = await loadOut();
+    for (const id of Object.keys(out.students)) if (!graded.some(x => x.stu.id === id)) delete out.students[id];
+    const fresh = [];
+    const used = new Set();
+    for (let i = 0; i < graded.length; i++) {
+      const { stu, g } = graded[i];
+      let name = fileBase(g) + '.pdf';
+      if (used.has(name)) name = U.safeName(`${e.title} - ${g.name || 'student'} ${g.id || i + 1}`) + '.pdf';
+      used.add(name);
+      const ent = out.students[stu.id];
+      if (ent && ent.stamp === stu.approvedAt && ent.name === name && ent.blob) continue;
+      setGen(`Student PDF ${i + 1} of ${graded.length}: ${g.name || g.id || 'student'}`);
+      const urls = await studentUrls(stu);
+      const doc = Export.newDoc();
+      doc.setProperties({ title: `${e.title} - ${g.name || g.id}`, creator: 'Exam Grader' });
+      urls.forEach((u, k) => Export.addJpegPage(doc, u, k === 0));
+      out.students[stu.id] = { name, blob: doc.output('blob'), stamp: stu.approvedAt, total: g.total };
+      fresh.push(stu.id);
+      await U.sleep(0);
+    }
+    let classPages = 0;
+    if (graded.length) {
+      setGen('Building the class PDF...');
+      const doc = Export.newDoc();
+      doc.setProperties({ title: e.title + ' - class', creator: 'Exam Grader' });
+      for (let i = 0; i < graded.length; i++) {
+        setGen(`Class PDF: student ${i + 1} of ${graded.length}`);
+        const urls = await studentUrls(graded[i].stu);
+        urls.forEach(u => { Export.addJpegPage(doc, u, classPages === 0); classPages++; });
+        await U.sleep(0);
+      }
+      out.classPdf = { name: U.safeName(`${e.title} - class`) + '.pdf', blob: doc.output('blob'), pages: classPages };
+      const { header, rows } = gradebook(graded);
+      out.csv = { name: U.safeName(e.title + ' - gradebook') + '.csv', blob: new Blob([Export.csv([header, ...rows])], { type: 'text/csv' }) };
+      out.xlsx = { name: U.safeName(e.title + ' - gradebook') + '.xlsx', blob: new Blob([Export.xlsx(header, rows, e.title || 'Grades', itemStats(graded))], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }) };
+    } else { delete out.classPdf; delete out.csv; delete out.xlsx; }
+    out.at = Date.now(); out.count = graded.length; out.fresh = fresh.length;
+    out.cloud = null;
+    if (graded.length && st.cloudUrl && st.cloudToken) {
+      const exam = { id: e.id, title: e.title, course: e.course, school: e.school, version: e.version };
+      const b64 = async blob => (await U.blobToDataURL(blob)).split(',')[1];
+      try {
+        let n = 0;
+        for (const id of fresh) {
+          const ent = out.students[id];
+          setGen(`Saving to Google Drive: ${ent.name}`);
+          await Export.cloudPost(st.cloudUrl, st.cloudToken, { action: 'savePdf', exam, filename: ent.name, b64: await b64(ent.blob) });
+          n++;
+        }
+        setGen('Saving the class PDF to Google Drive...');
+        const rc = await Export.cloudPost(st.cloudUrl, st.cloudToken, { action: 'savePdf', exam, filename: out.classPdf.name, b64: await b64(out.classPdf.blob) });
+        setGen('Saving the gradebook to Google Sheets...');
+        const { header, rows } = gradebook(graded);
+        const rg = await Export.cloudPost(st.cloudUrl, st.cloudToken, { action: 'saveGrades', exam, header, rows });
+        out.cloud = { ok: true, pdfs: n + 1, rows: rows.length, sheet: rg.url || '', folder: rc.folder || '' };
+      } catch (err) { out.cloud = { ok: false, error: err.message }; }
+    }
+    await DB.setKV(outKey(), out);
+    setGen('');
+    await renderApproveSummary(out);
+    if (out.cloud && !out.cloud.ok) toast('Saving to Google Drive failed: ' + out.cloud.error, 'bad');
+    else toast(`Done: ${graded.length} approved student(s), PDFs and gradebooks ready${out.cloud ? ' and saved to Google Drive' : ''}.`, 'good');
+  }
+
+  function outFiles(out) {
+    const files = [];
+    Object.values(out.students).forEach(s => files.push({ name: 'Student PDFs/' + s.name, data: s.blob }));
+    if (out.classPdf) files.push({ name: out.classPdf.name, data: out.classPdf.blob });
+    if (out.xlsx) files.push({ name: out.xlsx.name, data: out.xlsx.blob });
+    if (out.csv) files.push({ name: out.csv.name, data: out.csv.blob });
+    return files;
+  }
+
+  async function renderApproveSummary(out) {
+    const box = $('#approveSummary'); if (!box || !S.exam) return;
+    out = out || await loadOut();
+    box.innerHTML = '';
+    if (!out.at || !out.count) return;
+    const n = Object.keys(out.students).length;
+    const cloud = out.cloud;
+    box.appendChild(el('div', { class: 'card ok summary', id: 'genSummary' },
+      el('p', {}, el('strong', {}, `Generated ${new Date(out.at).toLocaleString()}: `),
+        `${n} approved student PDF(s), the class PDF (${out.classPdf ? out.classPdf.pages : 0} pages), the Excel and CSV gradebooks.`),
+      cloud ? el('p', { class: cloud.ok ? '' : 'warntext' }, cloud.ok ? `Saved to Google Drive: ${cloud.pdfs} PDF(s) this time and ${cloud.rows} gradebook row(s) in Google Sheets.` : `Saving to Google Drive failed: ${cloud.error}`,
+        cloud.ok && cloud.sheet ? el('a', { href: cloud.sheet, target: '_blank', rel: 'noopener' }, ' Open the sheet') : null) : null,
+      el('div', { class: 'row wrap' },
+        el('button', { class: 'btn primary', id: 'btnZip', onclick: async () => {
+          const o = await loadOut();
+          const blob = await Export.zip(outFiles(o));
+          U.download(blob, U.safeName(S.exam.title + ' - graded') + '.zip');
+        } }, 'Download all (ZIP)'),
+        out.classPdf ? el('button', { class: 'btn small', id: 'dlClass', onclick: () => U.download(out.classPdf.blob, out.classPdf.name) }, 'Class PDF') : null,
+        out.xlsx ? el('button', { class: 'btn small', id: 'dlXlsx', onclick: () => U.download(out.xlsx.blob, out.xlsx.name) }, 'Excel') : null,
+        out.csv ? el('button', { class: 'btn small', id: 'dlCsv', onclick: () => U.download(out.csv.blob, out.csv.name) }, 'CSV') : null)));
   }
   function stat(k, val) { return el('div', { class: 'stat' }, el('div', { class: 'k' }, k), el('div', { class: 'v' }, String(val))); }
 
@@ -1097,7 +1543,7 @@
         const sel = el('select', { 'data-q': i + 1 }, el('option', { value: '' }, 'Scan: ' + (r.read === 'single' ? (gradeOf(stu).mc[q.id].answer || r.read) : r.read)),
           q.choices.map((c, k) => el('option', { value: Layout.LETTERS[k], selected: r.override === Layout.LETTERS[k] }, Layout.LETTERS[k])),
           el('option', { value: 'BLANK', selected: r.override === 'BLANK' }, 'Blank'), el('option', { value: 'MULTI', selected: r.override === 'MULTI' }, 'Multiple'));
-        sel.onchange = async () => { if (sel.value) stu.mcOverride[q.id] = sel.value; else delete stu.mcOverride[q.id]; await saveStudent(stu); preview(stu); };
+        sel.onchange = async () => { if (sel.value) stu.mcOverride[q.id] = sel.value; else delete stu.mcOverride[q.id]; markDraft(stu); await saveStudent(stu); preview(stu); refreshDash(); };
         return el('label', { class: 'ovr ' + r.state }, `${i + 1}. key ${q.answer || '?'} `, sel);
       })));
     box.appendChild(el('div', { class: 'card' }, el('div', { class: 'row between' }, el('h3', {}, `Preview: ${g.id} ${g.name} - ${U.fmt(g.total)}/${U.fmt(g.max)} (${U.fmt(g.pct)}%)`), el('button', { class: 'btn small', onclick: () => { box.innerHTML = ''; } }, 'Close')),
@@ -1205,6 +1651,11 @@
         catch (err) { cloudMsg.textContent = 'Failed: ' + err.message; }
       } }, 'Test connection'), cloudMsg)));
     v.appendChild(await aiSettingsCard());
+    const autoAp = el('input', { type: 'checkbox', id: 's_autoApprove', checked: !!st.autoApprove });
+    autoAp.onchange = () => { st.autoApprove = autoAp.checked; saveSettings(); };
+    v.appendChild(el('div', { class: 'card', id: 'approveSettings' }, el('h3', {}, 'Approval'),
+      el('label', { class: 'small' }, autoAp, ' Auto-approve when no flags'),
+      el('p', { class: 'small muted' }, 'When on, a student is approved automatically as soon as everything is graded and nothing needs attention (no unclear bubbles, ID or page problems, low-confidence or illegible AI grades). Approval generates the PDFs and gradebooks and saves them to Google Drive if it is set up. Off by default.')));
     const est = await DB.estimate();
     v.appendChild(el('div', { class: 'card' }, el('h3', {}, 'Data and backup'),
       el('p', { class: 'small muted' }, est ? `Storage used: ${(est.usage / 1048576).toFixed(1)} MB of ${(est.quota / 1048576).toFixed(0)} MB available to this site.` : 'Storage estimate unavailable.'),
@@ -1222,10 +1673,10 @@
 
   async function aiSettingsCard() {
     const st = S.settings, ai = st.ai;
-    const card = el('div', { class: 'card', id: 'aiSettings' }, el('h3', {}, 'AI suggestions (Google Gemini)'));
+    const card = el('div', { class: 'card', id: 'aiSettings' }, el('h3', {}, 'AI grading of written answers (Google Gemini)'));
     if (!aiReady()) card.appendChild(el('p', { class: 'small warntext', id: 'aiNeedServer' }, 'Needs the Apps Script URL and token above, with a GEMINI_KEY script property on that server.'));
     const on = el('input', { type: 'checkbox', id: 'ai_on', checked: !!ai.enabled });
-    on.onchange = () => { ai.enabled = on.checked; saveSettings(); };
+    on.onchange = () => { ai.enabled = on.checked; saveSettings(); if (ai.enabled) { enqueueMissing(); runQueue(); } else renderQ(); };
     const sel = el('select', { id: 'ai_model' });
     const fillModels = () => {
       sel.innerHTML = '';
@@ -1248,7 +1699,7 @@
       } catch (err) { msg.textContent = 'Failed: ' + err.message; }
     };
     const used = await AI.today();
-    card.appendChild(el('label', { class: 'small' }, on, ' Suggest grades for written answers (button on the Grade screen, by question)'));
+    card.appendChild(el('label', { class: 'small' }, on, ' Grade written answers automatically with AI after scanning (drafts you can review)'));
     card.appendChild(el('div', { class: 'row wrap' },
       field('Model', sel),
       field('Requests per minute', num('rpm', { id: 'ai_rpm', min: 1, max: 60 })),
@@ -1257,8 +1708,8 @@
       el('button', { class: 'btn', id: 'btnAiTest', disabled: !aiReady(), onclick: loadModels }, 'Test connection and load models'), msg));
     card.appendChild(el('div', { class: 'small muted ainote' },
       el('p', {}, 'Google\'s free tier allows a limited number of requests per minute and per day for each model (often around 10 to 30 per minute and a few hundred to about a thousand per day; Google changes these limits). One answer is one request. The app slows itself down and stops at the daily limit set here.'),
-      el('p', {}, 'Only the cropped image of the answer box is sent, together with the question, answer key, rubric, preset comments and up to 4 of your graded answers to the same question as examples. Student names, IDs and the cover page are never sent.'),
-      el('p', {}, 'On Google\'s free tier, submitted content may be used by Google to improve its products and may be read by human reviewers. You are responsible for following your school\'s privacy rules (for example FERPA) before using this feature. Every suggestion must be accepted by you before it counts.')));
+      el('p', {}, 'For each written answer, only the cropped image of the student\'s answer box is sent, together with the same box from your uploaded key (model answer and rubric), the question, any typed key or rubric, and the preset comments. Student names, IDs and the cover page are never sent.'),
+      el('p', {}, 'On Google\'s free tier, submitted content may be used by Google to improve its products and may be read by human reviewers. You are responsible for following your school\'s privacy rules (for example FERPA) before using this feature. AI grades are drafts: nothing is final until you approve.')));
     return card;
   }
 
@@ -1291,14 +1742,12 @@
   // ---------------- Help ----------------
   function viewHelp(v) {
     const steps = [
-      ['Set up', 'Exams > New exam. Enter school, course, title, date, version and the number of student-ID digits. Add multiple-choice questions one by one or with Bulk paste, set the correct answers and points. Add written-response questions with maximum points and box height.'],
-      ['Print', 'Print > check the preflight result > Download exam PDF. Print at actual size on US Letter. Download the answer key PDF if you want one.'],
-      ['Scan', 'Scan > Start camera. Lay each page flat with the four black corner squares visible. The outline turns green and the page is captured after it is held still. Scan the cover first, then that student\'s other pages, then the next cover. Or upload scanner PDFs / photos.'],
-      ['Check pages', 'On the Scan screen each student shows the handwritten name, the read ID and the page chips. Fix the ID, page numbers or move pages to another student (drag a page onto a student card or use "Move to").'],
-      ['Review', 'Review lists bubbles that were too light or doubly marked. Choose the intended answer. Unreviewed questions get no mark and no points.'],
-      ['Grade written work', 'Grade > by question or by student. Tap points (half points available), add preset or typed comments, and write on the answer with the pen or stamp a check or cross. Everything saves automatically.'],
-      ['AI suggestions (optional)', 'Settings > AI suggestions: turn it on after adding GEMINI_KEY to the Apps Script server. On Grade > By question, grade a few answers yourself, then use "Suggest grades (AI)". Each suggestion is pending (dashed marks) until you Accept, Edit or Reject it; pending suggestions are not counted in totals or exports.'],
-      ['Export', 'Results > View a student to see the marked pages and override any answer. Export each student\'s PDF, the combined class PDF, CSV or Excel gradebook, or Save to Google Drive after setting it up in Settings.'],
+      ['Set up exam', 'Exams > New exam. Enter school, course, title, date, version and the number of student-ID digits. Add multiple-choice questions (one by one or with Bulk paste) with points, and written-response questions with maximum points and box height. Typed model answers and rubrics are optional.'],
+      ['Print', 'Print > check the preflight result > Download exam PDF. Print at actual size on US Letter.'],
+      ['Upload key', 'Take one blank copy, shade the correct bubbles, and write (or type onto the PDF) the model answer and the rubric with points per element inside every written-answer box. Setup or Scan > Upload key (PDF or photos, any page order). The app reads the multiple-choice key from the bubbles and keeps each box as that question\'s key and rubric. Confirm any key answers it could not read. Uploading a new key regrades everything.'],
+      ['Scan students', 'Scan > Upload student scans (scanner PDFs or photos; one file per student or the whole class) or use the camera. Everything is graded automatically: bubbles are read and marked, and when AI grading is set up (Settings), every written answer is graded by AI in the background with red-pen marks, points and a comment. The progress bar under the menu shows the queue; it keeps going while you move around and resumes after a reload.'],
+      ['Review (optional)', 'Results shows every student with score, multiple-choice and written subtotals, flags, status and whether each written answer was graded by AI or by you. "Needs attention" lists unclear bubbles, ID or page problems, and low-confidence or illegible AI grades (illegible answers get 0 until you change them). Open any student or question to change points, comments or marks; your changes mark the item as teacher-graded. Use "Re-run AI on this question" if needed.'],
+      ['Approve', 'Results > Approve all (or Approve per student). Approving generates each student\'s marked PDF, the combined class PDF and the Excel and CSV gradebooks, and saves them to Google Drive / Sheets when the server is set up; otherwise use Download all (ZIP). Editing an approved student sets it back to Draft; approve again to regenerate. Settings > Approval can auto-approve students with no flags.'],
       ['Backup', 'Settings > Export backup regularly. Data lives only in this browser until you export or save to Drive.']
     ];
     v.appendChild(el('h2', {}, 'Help'));
@@ -1311,6 +1760,6 @@
   }
 
   // expose a small hook for automated tests
-  window.ExamGrader = { S, go, selectExam, parseBulk, gradeOf, renderStudentPages, saveExam, commitBatch, makeScan };
+  window.ExamGrader = { S, Q, go, selectExam, parseBulk, gradeOf, renderStudentPages, saveExam, commitBatch, makeScan, approveStudents, runQueue, loadOut: () => loadOut(), genChain: () => GEN.chain, genBusy: () => GEN.busy + (AUTO.set.size ? 1 : 0) };
   window.addEventListener('DOMContentLoaded', boot);
 })();

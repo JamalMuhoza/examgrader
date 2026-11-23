@@ -54,13 +54,18 @@ const Grade = (() => {
       out.mc[q.id] = r;
       out.mcTotal += r.pts;
     });
+    out.saFlags = 0;
     (exam.sa || []).forEach(q => {
       const g = (stu.sa && stu.sa[q.id]) || {};
       const max = +q.max || 0;
       out.saMax += max;
       const pts = g.pts === undefined || g.pts === null || g.pts === '' ? null : Math.max(0, Math.min(max, +g.pts));
       if (pts === null) out.ungraded++;
-      out.sa[q.id] = { pts, comments: g.comments || [], note: g.note || '' };
+      // source: 'ai' (draft from the automatic AI grading) or 'teacher' (graded or edited by the teacher)
+      const source = pts === null ? '' : (g.source || (g.ai === 'accepted' ? 'ai' : 'teacher'));
+      const flag = pts !== null && (g.flag === 'low' || g.flag === 'illegible') ? g.flag : (pts === null && g.flag === 'error' ? 'error' : null);
+      if (flag && pts !== null) out.saFlags++;
+      out.sa[q.id] = { pts, comments: g.comments || [], note: g.note || '', source, flag, aiRes: g.aiRes || null };
       out.saTotal += pts || 0;
     });
     out.total = out.mcTotal + out.saTotal;
@@ -70,9 +75,14 @@ const Grade = (() => {
     if (out.missing.length) st.push('missing p.' + out.missing.join(','));
     if (out.flags) st.push(out.flags + ' MC to review');
     if (out.ungraded) st.push(out.ungraded + ' SA ungraded');
+    if (out.saFlags) st.push(out.saFlags + ' SA flagged');
     if (!out.idOk) st.push('check ID');
     if (out.dups) st.push(out.dups + ' duplicate page(s)');
     out.complete = st.length === 0;
+    // items that need the teacher's attention before approval
+    out.attention = out.missing.length + out.flags + out.ungraded + out.saFlags + (out.idOk ? 0 : 1) + out.dups;
+    out.approved = stu.status === 'approved';
+    out.approval = out.approved ? 'Approved' : 'Draft';
     out.status = out.complete ? 'Complete' : st.join('; ');
     out.pages = P.pages;
     return out;
@@ -153,21 +163,21 @@ const Grade = (() => {
   }
 
   function newStudent(examId, key) {
-    return { id: U.uid('st_'), examId, key, created: Date.now(), mcOverride: {}, sa: {}, ink: {} };
+    return { id: U.uid('st_'), examId, key, created: Date.now(), mcOverride: {}, sa: {}, ink: {}, status: 'draft' };
   }
 
   function header(exam) {
     const h = ['School', 'Course', 'Exam', 'Version', 'Student ID', 'Name (roster)'];
     (exam.mc || []).forEach((q, i) => h.push('Q' + (i + 1)));
     (exam.sa || []).forEach((q, i) => h.push('SA' + (i + 1)));
-    h.push('MC subtotal', 'SA subtotal', 'Total', 'Max', 'Percent', 'Status');
+    h.push('MC subtotal', 'SA subtotal', 'Total', 'Max', 'Percent', 'Status', 'Approval');
     return h;
   }
   function row(exam, g) {
     const r = [exam.school || '', exam.course || '', exam.title || '', exam.version || '', g.id || '', g.name || ''];
     (exam.mc || []).forEach(q => r.push(g.mc[q.id] ? g.mc[q.id].pts : ''));
     (exam.sa || []).forEach(q => r.push(g.sa[q.id] && g.sa[q.id].pts !== null ? g.sa[q.id].pts : ''));
-    r.push(g.mcTotal, g.saTotal, g.total, g.max, g.pct, g.status);
+    r.push(g.mcTotal, g.saTotal, g.total, g.max, g.pct, g.status, g.approval);
     return r;
   }
   function sortKey(g) { return (g.name || '~') + '|' + (g.id || ''); }

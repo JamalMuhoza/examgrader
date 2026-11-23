@@ -1,5 +1,5 @@
-/* Exam Grader - optional AI grading suggestions (Google Gemini through the teacher's own Apps Script server).
- * Only the cropped answer box of a written question is sent. Suggestions stay pending until the teacher accepts them. */
+/* Exam Grader - automatic AI grading of written answers (Google Gemini through the teacher's own Apps Script server).
+ * Only the cropped answer box (and the same box from the teacher's key) is sent. Results are draft grades the teacher can correct. */
 'use strict';
 
 const AI = (() => {
