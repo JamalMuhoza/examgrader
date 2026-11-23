@@ -69,8 +69,66 @@ const Layout = (() => {
   function setF(doc, style, uni) { if (uni) doc.setFont(uniFont(doc), 'normal'); else doc.setFont('helvetica', style); }
   const imgFmt = src => /^data:image\/png/.test(src) ? 'PNG' : 'JPEG';
 
+  // ---------- rich text: ^{..} superscript, _{..} subscript ----------
+  const MARK = /\^\{([^{}]*)\}|_\{([^{}]*)\}/g;
+  const hasMarkup = t => /\^\{[^{}]*\}|_\{[^{}]*\}/.test(String(t || ''));
+  const SCRIPT = 0.68;
+  function runsOf(text) {
+    const out = []; let last = 0, m;
+    text = String(text || ''); MARK.lastIndex = 0;
+    while ((m = MARK.exec(text))) {
+      if (m.index > last) out.push({ t: text.slice(last, m.index), k: 0 });
+      out.push({ t: m[1] !== undefined ? m[1] : m[2], k: m[1] !== undefined ? 1 : -1 });
+      last = m.index + m[0].length;
+    }
+    if (last < text.length) out.push({ t: text.slice(last), k: 0 });
+    return out;
+  }
+  function runW(doc, r, size) { doc.setFontSize(r.k ? size * SCRIPT : size); return doc.getTextWidth(r.t); }
+  // greedy word wrap of runs; a word may hold several runs ("H_{2}O"); lines are { runs: [...] }
+  function richWrap(doc, text, width, size, style, uni) {
+    setF(doc, style, uni);
+    const lines = [];
+    String(text || '').replace(/\r/g, '').split('\n').forEach(par => {
+      if (!par.trim()) { lines.push(''); return; }
+      const words = []; let cur = [];
+      runsOf(par).forEach(r => {
+        const t = uni ? r.t : U.pdfText(r.t);
+        if (r.k) { cur.push({ t, k: r.k }); return; }
+        t.split(/(\s+)/).forEach(seg => {
+          if (!seg) return;
+          if (/^\s+$/.test(seg)) { if (cur.length) words.push(cur); cur = []; }
+          else cur.push({ t: seg, k: 0 });
+        });
+      });
+      if (cur.length) words.push(cur);
+      doc.setFontSize(size); const sp = doc.getTextWidth(' ');
+      let line = [], lw = 0;
+      words.forEach(wd => {
+        const ww = wd.reduce((a, r) => a + runW(doc, r, size), 0);
+        if (line.length && lw + sp + ww > width) { lines.push({ runs: line }); line = []; lw = 0; }
+        if (line.length) { line.push({ t: ' ', k: 0 }); lw += sp; }
+        line.push(...wd); lw += ww;
+      });
+      if (line.length) lines.push({ runs: line });
+    });
+    doc.setFontSize(size);
+    while (lines.length && lines[lines.length - 1] === '') lines.pop();
+    return lines;
+  }
+  function drawRuns(doc, runs, x, y, size) {
+    runs.forEach(r => {
+      doc.setFontSize(r.k ? size * SCRIPT : size);
+      const dy = r.k === 1 ? -size * 0.36 * PTMM : r.k === -1 ? size * 0.2 * PTMM : 0;
+      doc.text(r.t, x, y + dy);
+      x += doc.getTextWidth(r.t);
+    });
+    doc.setFontSize(size);
+  }
+
   // ---------- text helpers ----------
   function wrap(doc, text, width, size, style = 'normal', uni = false) {
+    if (hasMarkup(text)) return richWrap(doc, text, width, size, style, uni);
     setF(doc, style, uni); doc.setFontSize(size);
     const paras = (uni ? String(text || '') : U.pdfText(text)).replace(/\r/g, '').split('\n');
     const lines = [];
@@ -139,7 +197,7 @@ const Layout = (() => {
     const imgsH = (imgs, w) => (imgs || []).filter(Boolean).reduce((a, im) => a + fitBox(im, w, 70).h + 1.2, 0);
     mcs.forEach((q, qi) => {
       const look = lookOn(q);
-      const uni = !look && exam.uniText === true && needsUni(q.stem, ...(q.choices || []));
+      const uni = !look && exam.uniText === true && !!UNI;   // one font for every question (symbols and scripts print the same everywhere)
       const nCh = Math.max(2, Math.min(5, (q.choices || []).length || 4));
       let stemLines = [], stemH, stemImg = null, numY = null;
       const sc = look ? q.look.stem : null;
@@ -217,7 +275,7 @@ const Layout = (() => {
         y = CONTENT.bottom + 1;
         return;
       }
-      const uni = exam.uniText === true && needsUni(q.prompt);
+      const uni = exam.uniText === true && !!UNI;
       const lines = q.prompt && q.prompt.trim() && !q.img ? wrap(doc, q.prompt, stemW, P_PT, 'normal', uni) : (q.img ? [] : ['']);
       const pImgs = [q.img, ...(q.imgs || [])].filter(Boolean).map(im => fitBox(im, stemW, 90));
       const boxH = Math.max(1, q.lines || 6) * 8;
@@ -307,7 +365,7 @@ const Layout = (() => {
 
   function textLines(doc, lines, x, y0, size, style, lineH, color = 20, uni = false) {
     setF(doc, style, uni); doc.setFontSize(size); doc.setTextColor(color);
-    lines.forEach((ln, i) => { if (ln) doc.text(ln, x, y0 + i * lineH); });
+    lines.forEach((ln, i) => { if (!ln) return; if (typeof ln === 'string') doc.text(ln, x, y0 + i * lineH); else drawRuns(doc, ln.runs, x, y0 + i * lineH, size); });
   }
 
   function buildPDF(exam, L, opts = {}) {
@@ -457,5 +515,5 @@ const Layout = (() => {
   // pages that are printed but never graded (kept cover art, reference pages): a student may hand them in or not
   function ungradedPage(L, p) { const pg = (L.pages || []).find(x => x.no === p); return !!pg && (pg.kind === 'ref' || pg.kind === 'extra'); }
 
-  return { PAGE, DPI, PX, RW, RH, MK, MARKERS, CODE, SAFE, CONTENT, BUB_R, LETTERS, compute, buildPDF, preflight, codeBits, decodeBits, codeCells, examHash, mm2px, px2mm, loadFont, needsUni, ungradedPage, fontReady: () => !!UNI };
+  return { PAGE, DPI, PX, RW, RH, MK, MARKERS, CODE, SAFE, CONTENT, BUB_R, LETTERS, compute, buildPDF, preflight, codeBits, decodeBits, codeCells, examHash, mm2px, px2mm, loadFont, needsUni, ungradedPage, fontReady: () => !!UNI, runsOf, hasMarkup };
 })();

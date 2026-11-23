@@ -202,7 +202,9 @@
       mcBox.appendChild(el('div', { class: 'row between' }, el('h3', {}, `Multiple choice (${e.mc.length} questions, ${U.fmt(pts)} points)`),
         el('div', { class: 'row wrap' },
           el('button', { class: 'btn', id: 'btnAddMC', onclick: () => { e.mc.push({ id: uid('q_'), stem: '', choices: ['', '', '', ''], answer: '', points: 1 }); saveSoon(); renderMC(); } }, 'Add question'),
-          el('button', { class: 'btn', onclick: () => bulk.classList.toggle('hidden') }, 'Bulk paste'))));
+          el('button', { class: 'btn', onclick: () => bulk.classList.toggle('hidden') }, 'Bulk paste'),
+          el('button', { class: 'btn', id: 'btnSup', title: 'Superscript: type ^{..} around the raised part (x² is written x^{2})', onmousedown: ev => ev.preventDefault(), onclick: () => insertMark('^') }, 'x²'),
+          el('button', { class: 'btn', id: 'btnSub', title: 'Subscript: type _{..} around the lowered part (H₂O is written H_{2}O)', onmousedown: ev => ev.preventDefault(), onclick: () => insertMark('_') }, 'x₂'))));
       const bulk = el('div', { class: 'bulk hidden', id: 'bulkBox' },
         el('p', { class: 'small muted' }, 'Paste questions in the Exam template format. Start each question with its number ("1." or "1)"), each choice with a letter ("A.", "b)" or "(c)"). Mark the correct choice with * or "(correct)", or add "Answer: C" under the question or an "Answer key" list (1-B 2-C) at the end. Written questions start with "SA1." and may have Key:, Rubric: and Lines: lines. An answer key string (for example ABDCE...) overrides the marks.'),
         el('textarea', { id: 'bulkText', rows: 10, placeholder: '1. Which element has the highest electronegativity?\nA. Oxygen\n*B. Fluorine\nC. Chlorine\nD. Nitrogen' }),
@@ -267,6 +269,20 @@
   }
   const buildNavSoon = (() => { let t; return () => { clearTimeout(t); t = setTimeout(buildNav, 600); }; })();
 
+  // x² / x₂ buttons: wrap the selection (or insert empty braces) in the text field last used
+  let lastField = null;
+  document.addEventListener('focusin', ev => { const t = ev.target; if (t && t.matches && t.matches('.mc-stem, .mc-choice, .sa-prompt, #bulkText')) lastField = t; });
+  function insertMark(kind) {
+    const f = lastField && document.contains(lastField) ? lastField : document.querySelector('.mc-stem');
+    if (!f) return;
+    const a = f.selectionStart ?? f.value.length, b = f.selectionEnd ?? a;
+    const sel = f.value.slice(a, b);
+    f.value = f.value.slice(0, a) + kind + '{' + sel + '}' + f.value.slice(b);
+    f.focus();
+    const pos = a + 2 + sel.length;
+    f.setSelectionRange(sel ? pos + 1 : pos, sel ? pos + 1 : pos);
+    f.dispatchEvent(new Event('input', { bubbles: true }));
+  }
   function mcRow(q, i, rerender) {
     const e = S.exam;
     const choicesBox = el('div', { class: 'choices' });
@@ -283,9 +299,25 @@
       ansSel.appendChild(el('option', { value: '' }, 'Key?'));
       q.choices.forEach((c, k) => ansSel.appendChild(el('option', { value: Layout.LETTERS[k], selected: q.answer === Layout.LETTERS[k] }, Layout.LETTERS[k])));
     };
+    // preview of the printed text (superscripts / subscripts) and the question's pictures
+    const prev = el('div', { class: 'mc-preview small' });
+    const drawPrev = () => {
+      prev.innerHTML = '';
+      const has = Layout.hasMarkup([q.stem, ...q.choices].join(' ')) || (q.imgs || []).length || (q.choiceImgs || []).some(Boolean);
+      prev.classList.toggle('hidden', !has);
+      if (!has) return;
+      prev.appendChild(el('div', { class: 'muted' }, 'Printed as:'));
+      prev.appendChild(el('div', {}, richText(q.stem)));
+      (q.imgs || []).forEach((f, k) => prev.appendChild(el('span', { class: 'figwrap' }, el('img', { class: 'impcrop fig', src: f.src, style: cropW(f), alt: 'Figure ' + (k + 1) }),
+        el('button', { class: 'btn small', title: 'Remove this picture from the question', onclick: () => { q.imgs.splice(k, 1); saveSoon(); drawPrev(); } }, 'Remove'))));
+      prev.appendChild(el('ol', { class: 'impchoices' }, q.choices.map((c, k) => el('li', { class: 'impchoice' }, el('span', { class: 'bub' }, Layout.LETTERS[k]), el('span', {}, richText(c)),
+        q.choiceImgs && q.choiceImgs[k] ? el('img', { class: 'impcrop fig', src: q.choiceImgs[k].src, style: cropW(q.choiceImgs[k]), alt: 'Picture of choice ' + Layout.LETTERS[k] }) : null))));
+    };
+    choicesBox.addEventListener('input', drawPrev);
     nSel.onchange = () => { const n = +nSel.value; while (q.choices.length < n) q.choices.push(''); q.choices.length = n; if (q.answer && Layout.LETTERS.indexOf(q.answer) >= n) q.answer = ''; drawChoices(); saveSoon(); };
     ansSel.onchange = () => { q.answer = ansSel.value; saveSoon(); };
     drawChoices();
+    drawPrev();
     let lookBox = null;
     if (q.look) {
       const tx = el('input', { type: 'checkbox', class: 'mc-usetext', checked: !!q.useText });
@@ -299,8 +331,9 @@
       el('div', { class: 'qnum' }, (q.label || i + 1) + '.'),
       el('div', { class: 'qbody' },
         lookBox,
-        inp(q, 'stem', { multiline: true, rows: 2, class: 'mc-stem', placeholder: 'Question text (optional)' }),
+        inp(q, 'stem', { multiline: true, rows: 2, class: 'mc-stem', placeholder: 'Question text (optional)' }, drawPrev),
         choicesBox,
+        prev,
         el('div', { class: 'row wrap' }, nSel, field('Correct', ansSel), field('Points', inp(q, 'points', { type: 'number', min: 0, step: 0.5, class: 'narrow mc-points' })))),
       el('div', { class: 'qtools' },
         el('button', { class: 'btn small', onclick: () => { if (i) { [e.mc[i - 1], e.mc[i]] = [e.mc[i], e.mc[i - 1]]; saveSoon(); rerender(); } } }, 'Up'),
@@ -466,7 +499,8 @@
       S.imp = { src, det, res: det, ai: null, aiError: '', busy: '' };
       const n = det.mc.length + det.sa.length;
       const loose = det.skipped.filter(x => x.why !== 'before the first question').length;
-      const incomplete = !src.template && det.source !== 'pdf' && (n === 0 || src.scanned > 0 || loose >= 5 || (det.mc.length > 0 && det.mc.filter(q => q.choices.length < 2).length > det.mc.length / 2));
+      const layoutIssues = det.source === 'pdf' && det.warnings.some(w => w.level === 'warn' && /may not be split|no answer choices|only choice A|was not found|is empty/.test(w.msg));
+      const incomplete = !src.template && (layoutIssues || det.source !== 'pdf') && (layoutIssues || n === 0 || src.scanned > 0 || loose >= 5 || (det.mc.length > 0 && det.mc.filter(q => q.choices.length < 2).length > det.mc.length / 2));
       S.imp.incomplete = incomplete;
       say('');
       go('import');
@@ -474,12 +508,12 @@
     } catch (err) { console.error(err); say('Could not read the file: ' + err.message); toast('Could not read the file', 'bad'); }
   }
   function docWarnings(res, src) {
-    if (src.figures && !res.look) {
+    if (src.figures && res.source !== 'pdf' && !res.fromPdf) {
       const nImg = (res.mc || []).reduce((a, q) => a + (q.imgs || []).length + (q.choiceImgs || []).filter(Boolean).length, 0) + (res.sa || []).reduce((a, q) => a + (q.imgs || []).length, 0) + (res.pages || []).length;
       if (nImg) res.warnings.push({ level: 'info', msg: `The document contains ${src.figures} picture(s); ${nImg} were placed in the questions they belong to. Check them below.` });
       else res.warnings.push({ level: 'warn', msg: `The document contains ${src.figures} picture(s) or figure(s). Figures are not copied; add them by hand.` });
     }
-    if (src.scanned && res.source !== 'ai' && !res.look) res.warnings.push({ level: 'warn', msg: `${src.scanned} page(s) are images without a text layer (scans or photos). They can only be read with AI reading` + (aiImportOn() ? '.' : ' (Settings > AI grading > tick the box).') });
+    if (src.scanned && res.source !== 'ai' && res.source !== 'pdf') res.warnings.push({ level: 'warn', msg: `${src.scanned} page(s) are images without a text layer (scans or photos). They can only be read with AI reading` + (aiImportOn() ? '.' : ' (Settings > AI grading > tick the box).') });
   }
   async function runAiImport() {
     const imp = S.imp; if (!imp || imp.busy) return;
@@ -494,7 +528,7 @@
         if (!r.ok) throw new Error(r.error || 'Could not load models');
         ai.models = r.models || []; await saveSettings();
       }
-      const res = await Maker.aiRead(imp.src, { post: p => AI.post(st.cloudUrl, st.cloudToken, p), model: AI.modelOf(ai), rpm: ai.rpm, onStatus: upd });
+      const res = await Maker.aiRead(imp.src, { post: p => AI.post(st.cloudUrl, st.cloudToken, p), model: AI.modelOf(ai), rpm: ai.rpm, onStatus: upd, layout: imp.det && imp.det.source === 'pdf' ? imp.det : null });
       docWarnings(res, imp.src);
       imp.ai = res; imp.res = res;
     } catch (err) { console.error(err); imp.aiError = err.message; }
@@ -514,12 +548,10 @@
     v.appendChild(el('h2', {}, 'Check the imported questions'));
     v.appendChild(el('div', { class: 'card', id: 'impSummary' },
       el('p', {}, el('strong', {}, imp.src.name), el('span', { class: 'muted' }, ' | read by ' + (r.source === 'ai' ? `AI (Gemini, ${r.requests} request${r.requests > 1 ? 's' : ''}): compare with your document` : r.source === 'template' ? 'the Word template reader (no AI)' : r.source === 'pdf' ? 'the page layout reader (no AI)' : 'the document parser'))),
-      el('p', { id: 'impCounts' }, `${mcs.length} multiple choice (${nKey} with the correct answer), ${r.sa.length + nW} written` + (r.look ? `, ${(r.pages || []).filter(p => p.kind === 'reference').length} reference page(s).` : '.')),
+      el('p', { id: 'impCounts' }, `${mcs.length} multiple choice (${nKey} with the correct answer), ${r.sa.length + nW} written` + (r.srcPages ? `, ${(r.pages || []).filter(p => p.kind === 'reference').length} reference page(s), ${r.mc.reduce((a, q) => a + (q.imgs || []).length + (q.choiceImgs || []).filter(Boolean).length, 0)} figure(s).` : '.')),
       imp.busy ? el('p', { class: 'warntext', id: 'impAiStatus' }, imp.busy) : null,
       imp.aiError ? el('p', { class: 'warntext', id: 'impAiError' }, 'AI reading failed: ' + imp.aiError) : null,
       !aiImportOn() && imp.incomplete ? el('p', { class: 'small muted' }, 'Some of this document could not be read automatically. Turn on AI reading in Settings (Apps Script server with a Gemini key) to read scans and unusual layouts, or fix the document using the blank template format.') : null,
-      r.look ? el('label', { class: 'small row tight', id: 'impLookRow' }, (() => { const c = el('input', { type: 'checkbox', id: 'impKeepLook', checked: r.keepLook !== false }); c.onchange = () => { r.keepLook = c.checked; schedulePreview(); }; return c; })(),
-        ' Keep original look (print each question and choice exactly as cut from your PDF; untick to print the typed text)') : null,
       el('div', { class: 'row wrap' },
         el('button', { class: 'btn primary', id: 'btnImpCreate', disabled: !(mcs.length + r.sa.length + nW) || !!imp.busy, onclick: () => createFromImport() }, 'Create exam from this'),
         aiImportOn() && r.source !== 'template' ? el('button', { class: 'btn', id: 'btnImpAI', disabled: !!imp.busy, onclick: () => runAiImport() }, imp.ai ? 'Read again with AI' : 'Use AI to read my exam') : null,
@@ -534,7 +566,7 @@
           el('ul', { class: 'warnlist' }, r.skipped.map(x => el('li', {}, el('span', { class: 'rawtext' }, x.raw), el('span', { class: 'muted small' }, ' (' + x.why + ')'))))) : null));
     }
     // side by side: the teacher's pages and the printed exam
-    if (r.look) {
+    if (r.srcPages) {
       const srcCol = el('div', { class: 'sbscol', id: 'impSrcPages' }, el('h4', {}, 'Your document'),
         el('div', { class: 'sbsthumbs' }, (r.srcPages || []).map(p => el('figure', { class: 'sthumb', 'data-page': p.no }, el('img', { src: p.thumb, alt: 'Page ' + p.no + ' of your document', loading: 'lazy' }),
           el('figcaption', {}, `Page ${p.no}: ` + pageKindText(r, p))))));
@@ -559,7 +591,7 @@
           q.key ? el('div', { class: 'small' }, el('strong', {}, 'Key: '), q.key) : null,
           q.rubric ? el('div', { class: 'small' }, el('strong', {}, 'Rubric: '), q.rubric) : null)));
     });
-    if (r.sa.length || !r.look) v.appendChild(saBox);
+    if (r.sa.length || !r.srcPages) v.appendChild(saBox);
     if (r.pages && r.pages.length) {
       const pb = el('div', { class: 'card', id: 'impPages' }, el('h3', {}, `Pages that are not multiple choice (${r.pages.length})`),
         el('p', { class: 'small muted' }, 'Written pages are printed with the student name line and page code, graded as one written item (AI or by hand; upload a filled copy as the key). Reference pages are printed but never graded.'));
@@ -581,7 +613,7 @@
     }
     const unused = (r.unused || []).concat((r.pages || []).filter(p => p.kind === 'ignored' || p.kind === 'cover').map(p => ({ page: p.page, text: p.kind === 'cover' ? 'Cover page' : 'Whole page', img: p.img, why: p.kind === 'cover' ? 'replaced by the app cover (name and student ID bubbles)' : p.why || 'set to Not used' })))
       .concat(r.mc.filter(q => q.kind === 'ignored').map(q => ({ page: q.page, text: 'Question ' + q.num, img: q.look && q.look.stem, why: 'set to Not used' })));
-    if (r.look || unused.length) {
+    if (r.srcPages || unused.length) {
       v.appendChild(el('div', { class: 'card', id: 'impUnused' }, el('h3', {}, `Not used (${unused.length})`),
         el('p', { class: 'small muted' }, 'Everything from your document that is not in a question or a printed page is listed here, so nothing disappears without you seeing it.'),
         unused.length ? el('div', { class: 'unusedlist' }, unused.map(u => el('div', { class: 'unused' }, u.img ? el('img', { src: u.img.src, alt: u.text, loading: 'lazy' }) : null,
@@ -589,6 +621,12 @@
     }
   }
   const cropW = c => c && c.wpt ? `width:${Math.round(c.wpt * 1.15)}px` : '';
+  // ^{..} / _{..} shown as raised / lowered text (built as DOM nodes, never as HTML)
+  function richText(t) {
+    const frag = document.createDocumentFragment();
+    Layout.runsOf(String(t || '')).forEach(r => frag.appendChild(r.k ? el(r.k === 1 ? 'sup' : 'sub', {}, r.t) : document.createTextNode(r.t)));
+    return frag;
+  }
   function pageKindText(r, p) {
     const it = (r.pages || []).find(x => x.page === p.no);
     if (it) return KIND_LABEL[it.kind] || it.kind;
@@ -597,24 +635,24 @@
   }
   function impQuestion(r, q, i, rerender, L_) {
     const kind = q.kind || 'mc';
-    const lookOK = r.look && r.keepLook !== false && q.look && !q.useText;
     const typeSel = el('select', { class: 'imp-kind' }, [['mc', 'Multiple choice'], ['written', 'Written question'], ['ignored', 'Not used']].map(([k, t]) => el('option', { value: k, selected: kind === k }, t)));
     typeSel.onchange = () => { q.kind = typeSel.value; rerender(); };
     const pts = el('input', { type: 'number', min: 0, step: 0.5, class: 'narrow imp-pts', value: q.points || 1 });
     pts.oninput = () => { q.points = +pts.value || null; };
     const key = el('select', { class: 'imp-correct' }, el('option', { value: '' }, 'Key?'), q.choices.slice(0, 5).map((c, k) => el('option', { value: k, selected: q.correct === k }, L_[k])));
     key.onchange = () => { q.correct = key.value === '' ? null : +key.value; rerender(); };
+    const figImg = (f, alt) => f ? el('img', { class: 'impcrop fig', src: f.src, style: cropW(f), alt, title: (f.id ? f.id + ': ' : '') + (f.kind || 'picture') + (f.page ? ', page ' + f.page : '') }) : null;
     const choiceRow = (c, k) => {
-      const crop = lookOK && q.look.choices[k];
+      const f = q.choiceImgs && q.choiceImgs[k];
       return el('li', { class: 'impchoice' + (k === q.correct ? ' correct' : '') + (k >= 5 ? ' over' : '') },
-        el('span', { class: 'bub' }, L_[k] || '?'), crop ? el('img', { class: 'impcrop', src: crop.src, style: cropW(crop), alt: 'Choice ' + L_[k] + ': ' + c }) : el('span', {}, c), k === q.correct ? el('strong', { class: 'oktext' }, ' correct') : null);
+        el('span', { class: 'bub' }, L_[k] || '?'), el('span', { class: 'rich' }, richText(c)), figImg(f, 'Picture of choice ' + L_[k]), k === q.correct ? el('strong', { class: 'oktext' }, ' correct') : null);
     };
     return el('div', { class: 'impq' + (kind !== 'mc' ? ' dim' : ''), 'data-i': i, 'data-num': q.num },
       el('div', { class: 'qnum' }, (q.num || i + 1) + '.'),
       el('div', { class: 'qbody' },
-        lookOK && q.look.stem ? el('img', { class: 'impcrop stem', src: q.look.stem.src, style: cropW(q.look.stem), alt: 'Question ' + q.num + ' as in your document' }) : null,
-        el('div', { class: lookOK ? 'impstem small muted' : 'impstem' }, lookOK ? el('details', {}, el('summary', {}, 'Text version'), q.stem, el('ol', { class: 'small' }, q.choices.map((c, k) => el('li', {}, L_[k] + '. ' + c)))) : (q.stem || el('em', { class: 'muted' }, '(no question text)')),
-          !lookOK && q.points ? el('span', { class: 'muted small' }, ` (${U.fmt(q.points)} pt${q.points === 1 ? '' : 's'})`) : null),
+        el('div', { class: 'impstem rich' }, q.stem ? richText(q.stem) : el('em', { class: 'muted' }, '(no question text)'),
+          q.points ? el('span', { class: 'muted small' }, ` (${U.fmt(q.points)} pt${q.points === 1 ? '' : 's'})`) : null),
+        (q.imgs || []).length ? el('div', { class: 'impfigs' }, q.imgs.map((f, k) => figImg(f, 'Figure ' + (k + 1) + ' of question ' + q.num))) : null,
         el('ol', { class: 'impchoices' }, q.choices.map(choiceRow)),
         el('div', { class: 'row wrap tight impctl' },
           el('span', { class: 'small muted' }, `${q.choices.length} choices`),
@@ -635,22 +673,19 @@
   }
   async function mergeQuestions(r, i) {
     const a = r.mc[i], b = r.mc[i + 1];
+    const pad = (arr, n) => { const o = (arr || []).slice(0, n); while (o.length < n) o.push(null); return o; };
     a.stem = [a.stem, b.stem].filter(Boolean).join(' ');
-    if (a.look || b.look) {
-      a.look = a.look || { stem: null, choices: a.choices.map(() => null) };
-      const bl = b.look || { stem: null, choices: b.choices.map(() => null) };
-      if (!a.choices.length) a.look.stem = await stackCrops(a.look.stem, bl.stem);
-      a.look.choices = a.look.choices.concat(bl.choices);
-    }
+    if ((b.imgs || []).length) a.imgs = (a.imgs || []).concat(b.imgs);
+    if ((a.choiceImgs || []).some(Boolean) || (b.choiceImgs || []).some(Boolean)) a.choiceImgs = pad(a.choiceImgs, a.choices.length).concat(pad(b.choiceImgs, b.choices.length));
     a.choices = a.choices.concat(b.choices);
     if (a.correct === null || a.correct === undefined) a.correct = b.correct === null || b.correct === undefined ? null : b.correct + a.choices.length - b.choices.length;
     r.mc.splice(i + 1, 1);
   }
   function splitQuestion(r, i, k) {
     const a = r.mc[i];
-    const b = { ...a, stem: '', choices: a.choices.slice(k), correct: a.correct !== null && a.correct >= k ? a.correct - k : null, look: a.look ? { stem: null, choices: a.look.choices.slice(k) } : null };
+    const b = { ...a, stem: '', imgs: [], choices: a.choices.slice(k), correct: a.correct !== null && a.correct >= k ? a.correct - k : null, choiceImgs: a.choiceImgs ? a.choiceImgs.slice(k) : undefined };
     a.choices = a.choices.slice(0, k); if (a.correct !== null && a.correct >= k) a.correct = null;
-    if (a.look) a.look = { stem: a.look.stem, choices: a.look.choices.slice(0, k) };
+    if (a.choiceImgs) a.choiceImgs = a.choiceImgs.slice(0, k);
     r.mc.splice(i + 1, 0, b);
   }
   let previewTimer = null, previewJob = 0;
@@ -660,7 +695,6 @@
     const job = ++previewJob;
     try {
       const ex = Maker.toExam(newExam(), S.imp.res);
-      if (S.imp.res.look) ex.keepLook = S.imp.res.keepLook !== false;
       ex.layout = Layout.compute(ex);
       const doc = Layout.buildPDF(ex, ex.layout, {});
       const pdf = await pdfjsLib.getDocument({ data: doc.output('arraybuffer') }).promise;
@@ -682,7 +716,6 @@
   async function createFromImport() {
     const imp = S.imp; if (!imp) return;
     const ex = Maker.toExam(newExam(), imp.res);
-    if (imp.res.look) ex.keepLook = imp.res.keepLook !== false;
     S.exam = ex; await saveExam(); await selectExam(ex.id); buildNav();
     toast(`Exam created: ${ex.mc.length} multiple choice, ${ex.sa.length} written`, 'good');
     go('make');

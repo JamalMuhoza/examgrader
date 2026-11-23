@@ -33,12 +33,11 @@ const Maker = (() => {
   const IMG_TOKEN = /\u0001IMG(\d+)\u0001/g, TBL_TOKEN = /^\u0001TBL(\d+)\u0001$/;
   const SUPM = { '0': '⁰', '1': '¹', '2': '²', '3': '³', '4': '⁴', '5': '⁵', '6': '⁶', '7': '⁷', '8': '⁸', '9': '⁹', '+': '⁺', '-': '⁻', '−': '⁻', '=': '⁼', '(': '⁽', ')': '⁾', 'n': 'ⁿ' };
   const SUBM = { '0': '₀', '1': '₁', '2': '₂', '3': '₃', '4': '₄', '5': '₅', '6': '₆', '7': '₇', '8': '₈', '9': '₉', '+': '₊', '-': '₋', '−': '₋', '=': '₌', '(': '₍', ')': '₎' };
+  // superscript / subscript runs become ^{..} / _{..} (the app prints them raised / lowered)
   function vScript(t, va) {
     if (va !== 'superscript' && va !== 'subscript') return t;
-    const map = va === 'superscript' ? SUPM : SUBM;
     if (!t.trim()) return t;
-    if (t.split('').every(c => map[c] !== undefined || c === ' ')) return t.split('').map(c => map[c] || '').join('');
-    return (va === 'superscript' ? '^(' : '_(') + t + ')';
+    return (va === 'superscript' ? '^{' : '_{') + t.trim() + '}';
   }
   // rId -> picture file of word/document.xml
   async function docxRels(zip) {
@@ -290,8 +289,9 @@ const Maker = (() => {
         const r = await pdfExtract(await f.arrayBuffer(), (p, t) => onProgress && onProgress(`Reading ${f.name}: page ${p} of ${t}`));
         out.kinds.push('pdf'); out.figures += r.images;
         r.pages.forEach(p => p.image ? addImg(p.image) : addText(p.text));
-        // typed PDF (one file): cut the questions out of the page images so the printed exam keeps the original look
+        // typed PDF (one file): read questions, choices and figures from the page layout (text layer + pictures)
         if (files.length === 1 && typeof PdfSrc !== 'undefined' && r.pages.some(p => !p.image)) {
+          out.pdfBuf = await f.arrayBuffer();
           try { out.pdfLook = await PdfSrc.analyze(await f.arrayBuffer(), { meta: pdfMeta, onProgress: t => onProgress && onProgress(`${f.name}: ${t}`) }); }
           catch (err) { console.error(err); out.pdfLookError = err.message; }
         }
@@ -438,7 +438,7 @@ const Maker = (() => {
       if (pics.length && !t) {
         if (!cur) { res.skipped.push({ raw: '(picture)', why: 'picture outside the questions' }); continue; }
         if (cur.type === 'mc' && lastField === 'choice' && !String(cur.choices[cur.lastIdx]).replace('[picture]', '').trim()) {
-          const k = cur.lastIdx; cur.choiceImgs = cur.choiceImgs || []; cur.choiceImgs[k] = (cur.choiceImgs[k] ? cur.choiceImgs[k] : pics[0]); cur.choices[k] = '[picture]';
+          const k = cur.lastIdx; cur.choiceImgs = cur.choiceImgs || []; cur.choiceImgs[k] = (cur.choiceImgs[k] ? cur.choiceImgs[k] : pics[0]); cur.choices[k] = '';
           pics.slice(1).forEach(im => (cur.imgs = cur.imgs || []).push(im));
         } else (cur.imgs = cur.imgs || []).push(...pics);
         continue;
@@ -501,7 +501,7 @@ const Maker = (() => {
         const cm = t.match(RE.choice);
         if (cm && LET.indexOf(cm[2].toUpperCase()) === firstEmpty(cur)) {
           splitLabels(raw.replace(/\u00a0/g, ' ').replace(IMG_TOKEN, ' ').trim()).forEach(x => addChoice(x, bold));
-          if (pics.length) { const k = cur.lastIdx; cur.choiceImgs = cur.choiceImgs || []; cur.choiceImgs[k] = pics[0]; if (!cur.choices[k]) cur.choices[k] = '[picture]'; pics.slice(1).forEach(im => (cur.imgs = cur.imgs || []).push(im)); }
+          if (pics.length) { const k = cur.lastIdx; cur.choiceImgs = cur.choiceImgs || []; cur.choiceImgs[k] = pics[0]; if (!cur.choices[k]) cur.choices[k] = ''; pics.slice(1).forEach(im => (cur.imgs = cur.imgs || []).push(im)); }
           continue;
         }
         if (pics.length) (cur.imgs = cur.imgs || []).push(...pics);
@@ -641,18 +641,54 @@ const Maker = (() => {
     return reqs;
   }
 
+  // a typed PDF read by the layout reader: page text (with ^{..} / _{..} markup) + page pictures + the figure list, a few pages per request
+  async function pdfRequests(src, figures) {
+    const pdf = await pdfjsLib.getDocument({ data: src.pdfBuf.slice(0) }).promise;
+    const pages = src.pdfLook.pages, reqs = [];
+    for (let i = 0; i < pages.length; i += 4) {
+      const grp = pages.slice(i, i + 4).filter(p => p.text && p.text.trim());
+      if (!grp.length) continue;
+      const images = [];
+      for (const pg of grp) {
+        const page = await pdf.getPage(pg.no);
+        const v0 = page.getViewport({ scale: 1 }), vp = page.getViewport({ scale: Math.min(2.2, 1500 / Math.max(v0.width, v0.height)) });
+        const c = document.createElement('canvas'); c.width = Math.round(vp.width); c.height = Math.round(vp.height);
+        const ctx = c.getContext('2d'); ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
+        await page.render({ canvasContext: ctx, viewport: vp }).promise;
+        images.push(c.toDataURL('image/jpeg', 0.85).split(',')[1]);
+      }
+      const nos = new Set(grp.map(p => p.no));
+      reqs.push({ text: grp.map(p => `--- page ${p.no} ---\n` + p.text).join('\n'), images, figures: (figures || []).filter(f => nos.has(f.page)).map(f => ({ id: f.id, where: f.where })) });
+    }
+    pdf.destroy();
+    return reqs;
+  }
+  // every figure of a layout-reader result, with where the reader placed it (a hint for the AI)
+  function figureList(res) {
+    const out = [];
+    (res.mc || []).forEach(q => {
+      (q.imgs || []).forEach(f => out.push({ f, id: f.id, page: f.page, where: `page ${f.page}, ${f.kind || 'picture'} at ${f.box ? Math.round(f.box.x0) + ',' + Math.round(f.box.y0) : '?'} pt, placed with the text of question ${q.num}` }));
+      (q.choiceImgs || []).forEach((f, k) => { if (f) out.push({ f, id: f.id, page: f.page, where: `page ${f.page}, ${f.kind || 'picture'} at ${f.box ? Math.round(f.box.x0) + ',' + Math.round(f.box.y0) : '?'} pt, placed as choice ${LET[k]} of question ${q.num}` }); });
+    });
+    (res.sa || []).forEach(q => (q.imgs || []).forEach(f => out.push({ f, id: f.id, page: f.page, where: `page ${f.page}, placed with written question ${q.num}` })));
+    return out.filter(x => x.id);
+  }
+
   // post(payload) -> server JSON; ai = settings.ai; onStatus(msg)
-  async function aiRead(src, { post, model, rpm, onStatus, stopped = () => false }) {
-    const reqs = requestsFor(src);
+  async function aiRead(src, { post, model, rpm, onStatus, stopped = () => false, layout = null }) {
+    const figs = layout ? figureList(layout) : [];
+    const byId = new Map(figs.map(x => [x.id, x.f]));
+    const reqs = src.pdfLook && src.pdfBuf ? await pdfRequests(src, figs) : requestsFor(src);
     if (!reqs.length) throw new Error('The document has no text or page images to read');
-    const res = { title: '', fields: {}, mc: [], sa: [], warnings: [], skipped: [], keyApplied: 0, source: 'ai', requests: reqs.length };
+    const res = { title: '', fields: {}, mc: [], sa: [], warnings: [], skipped: [], keyApplied: 0, source: 'ai', requests: reqs.length, fromPdf: !!src.pdfLook };
+    if (layout && layout.pages) { res.pages = layout.pages; res.unused = layout.unused; res.srcPages = layout.srcPages; }
     for (let i = 0; i < reqs.length; i++) {
       let r, tries = 0;
       for (;;) {
         if (stopped()) throw new Error('Stopped');
         await AI.pace(rpm, stopped, w => onStatus && onStatus(`AI reading part ${i + 1} of ${reqs.length}: waiting ${Math.ceil(w / 1000)} s (rate limit)`));
         onStatus && onStatus(`AI reading part ${i + 1} of ${reqs.length}...`);
-        r = await post({ action: 'aiExtract', model, text: reqs[i].text || '', images: reqs[i].images || [], part: i + 1, parts: reqs.length });
+        r = await post({ action: 'aiExtract', model, text: reqs[i].text || '', images: reqs[i].images || [], figures: reqs[i].figures || [], part: i + 1, parts: reqs.length });
         await AI.bump();
         if (r && r.rateLimited && !r.dailyQuota && tries++ < 4) {
           const wait = Math.max(2, +r.retryAfter || 30);
@@ -665,7 +701,13 @@ const Maker = (() => {
       if (!r || !r.ok) throw new Error((r && r.error) || 'AI reading failed');
       const x = r.result || {};
       if (!res.title && x.title) res.title = x.title;
-      (x.mc || []).forEach(q => res.mc.push({ type: 'mc', num: res.mc.length + 1, docNum: q.number || '', stem: q.stem || '', choices: (q.choices || []).map(String), correct: (q.correct === null || q.correct === undefined) ? null : q.correct, points: q.points || null, part: i + 1, ai: true }));
+      (x.mc || []).forEach(q => {
+        const o = { type: 'mc', num: src.pdfLook && +q.number ? +q.number : res.mc.length + 1, docNum: q.number || '', stem: q.stem || '', choices: (q.choices || []).map(String), correct: (q.correct === null || q.correct === undefined) ? null : q.correct, points: q.points || null, part: i + 1, ai: true };
+        const sf = (q.stemFigures || []).map(id => byId.get(id)).filter(Boolean);
+        if (sf.length) o.imgs = sf;
+        (q.choiceFigures || []).forEach(cf => { const f = byId.get(cf.figure); if (f && cf.choice < o.choices.length) { o.choiceImgs = o.choiceImgs || []; o.choiceImgs[cf.choice] = f; } });
+        res.mc.push(o);
+      });
       (x.sa || []).forEach(q => res.sa.push({ type: 'sa', num: res.sa.length + 1, docNum: q.number || '', prompt: q.prompt || '', points: q.points || null, key: q.key || '', rubric: q.rubric || '', lines: q.lines || null, part: i + 1, ai: true }));
     }
     // an answer key listed at the end of a long document reaches the AI separately from its questions: apply it here
@@ -682,7 +724,7 @@ const Maker = (() => {
     if (applied) res.warnings.push({ level: 'info', msg: `${applied} correct answer(s) taken from the answer key list in the document.` });
     // verbatim check: the question text must appear in the document text
     if (src.text.trim()) {
-      const norm = s => String(s).toLowerCase().replace(/[^a-z0-9]+/g, '');
+      const norm = s => String(s).toLowerCase().replace(/[\^_]\{([^{}]*)\}/g, '$1').replace(/[^a-z0-9]+/g, '');
       const doc = norm(src.text.replace(new RegExp(BOLD, 'g'), ''));
       const notFound = [];
       res.mc.forEach(q => { const n = norm(q.stem).slice(0, 60); if (n.length > 8 && !doc.includes(n)) notFound.push('MC ' + q.num); });
@@ -860,7 +902,7 @@ const Maker = (() => {
       let ids = [];
       if (IMG_TOKEN.test(v)) { IMG_TOKEN.lastIndex = 0; const tp = takePics(v); v = tp.t; ids = tp.ids; }
       IMG_TOKEN.lastIndex = 0;
-      if (ids.length && cur && /^mc_[A-E]$/.test(tag) && cur.type === 'mc') { cur.picIds = cur.picIds || {}; cur.picIds[tag.slice(3)] = ids[0]; if (!v) v = '[picture]'; }
+      if (ids.length && cur && /^mc_[A-E]$/.test(tag) && cur.type === 'mc') { cur.picIds = cur.picIds || {}; cur.picIds[tag.slice(3)] = ids[0];  }
       else if (ids.length && (tag === 'mc_stem' || tag === 'sa_prompt')) { /* attached below once the block exists */ }
       let m;
       if ((m = tag.match(/^hdr_(\w+)$/))) { if (v && !(m[1] === 'instructions' && normWS(v) === TPL_INSTR)) res.fields[m[1]] = v; continue; }
@@ -929,7 +971,7 @@ const Maker = (() => {
     return finalize(res);
   }
 
-  // ---------------- PDF original look: merge the layout reader with the text parser ----------------
+  // ---------------- PDF layout reader merged with the text parser ----------------
   // lines the layout reader must not glue onto a question: answer lines, answer keys, written questions, section titles
   function pdfMeta(t) {
     t = clean(t);
@@ -941,7 +983,7 @@ const Maker = (() => {
   }
   // det = text parser result (answers, points, keys, written questions); ps = PdfSrc result (questions, crops, pages)
   function mergeLook(det, ps) {
-    const res = { title: det.title, fields: det.fields, mc: [], sa: [], warnings: [], skipped: [], keyApplied: det.keyApplied, source: 'pdf', look: true,
+    const res = { title: det.title, fields: det.fields, mc: [], sa: [], warnings: [], skipped: [], keyApplied: det.keyApplied, source: 'pdf',
       pages: ps.pageItems.map(p => ({ ...p })), unused: ps.unused, srcPages: ps.pages };
     const W_ = (msg, raw, level = 'warn') => res.warnings.push({ level, msg, raw });
     const byNum = new Map();
@@ -959,23 +1001,30 @@ const Maker = (() => {
       if (p.markedChoice >= 0) correct = p.markedChoice;
       else if (correct === null && marks.filter(Boolean).length === 1) correct = marks.indexOf(true);
       const points = tp.pts !== null ? tp.pts : d ? d.points : (saByNum.get(p.num) || {}).points || null;
+      const imgs = (p.stemFigs || []).slice();
       if (!choices.length) {
-        res.sa.push({ type: 'sa', num: p.num, prompt: tp.s, points, key: '', rubric: '', lines: null, fromMC: true, img: p.look.stem });
-        W_(`Question ${p.num} has no answer choices, so it was added as a written question (its original look is kept).`, tp.s);
+        res.sa.push({ type: 'sa', num: p.num, prompt: tp.s, points, key: '', rubric: '', lines: null, fromMC: true, imgs });
+        W_(`Question ${p.num} has no answer choices, so it was added as a written question.`, tp.s);
         return;
       }
-      const q = { type: 'mc', num: p.num, page: p.page, stem: tp.s, choices, correct, points, look: p.look, imgChoices: p.imgChoices, kind: 'mc' };
-      if (p.markedChoice >= 0 || marks.some(Boolean)) { q.useText = true; W_(`Question ${p.num}: the document marks the correct answer, so it prints as typed text (the original look would show the mark to students).`); }
-      if (p.choices.length > 5) q.useText = true;
+      const q = { type: 'mc', num: p.num, page: p.page, stem: tp.s, choices, correct, points, kind: 'mc' };
+      if (imgs.length) q.imgs = imgs;
+      if ((p.choiceFigs || []).some(Boolean)) q.choiceImgs = p.choiceFigs.slice();
+      q.choices.forEach((c, k) => { if (!c && !(q.choiceImgs && q.choiceImgs[k])) W_(`Question ${p.num}: choice ${LET[k]} is empty.`, p.stem); });
       res.mc.push(q);
     });
+    // figure ids (for the AI reader and the review screen)
+    let fid = 0;
+    res.mc.forEach(q => { (q.imgs || []).forEach(f => { f.id = 'F' + (++fid); }); (q.choiceImgs || []).forEach(f => { if (f) f.id = 'F' + (++fid); }); });
+    res.sa.forEach(q => (q.imgs || []).forEach(f => { f.id = 'F' + (++fid); }));
     const have = new Set(ps.mc.map(q => q.num));
     det.mc.filter(q => !have.has(q.num) && q.choices.length).forEach(q => { res.mc.push({ ...q, kind: 'mc' }); W_(`Question ${q.num} was found in the text but not on the page layout; it is printed as typed text.`, q.stem); });
     det.sa.filter(q => !(q.fromMC && have.has(q.num))).forEach(q => res.sa.push(q));
     finalize(res);
     res.warnings = res.warnings.filter(w => !/number\(s\) used more than once/.test(w.msg));
     const nX = res.pages.filter(p => p.kind === 'ignored').length;
-    W_(`Original look: each question and choice is cut from your PDF and printed next to the bubbles (superscripts, symbols and pictures as in your document).` +
+    const nF = fid;
+    W_(`Questions and choices were read as text (superscripts and subscripts written as ^{..} and _{..}); ${nF} figure(s) were copied as pictures.` +
       (nX ? ` ${nX} page(s) or section(s) without numbered questions (tables, pictures) are not used; you can include each one as a written or reference page below.` : ''), null, 'info');
     return res;
   }
@@ -997,7 +1046,7 @@ const Maker = (() => {
     exam.mc = imp.mc.filter(q => kindOf(q) === 'mc').map(q => {
       const choices = q.choices.slice(0, 5).map(c => String(c));
       while (choices.length < 2) choices.push('');
-      const o = { id: U.uid('q_'), ...(imp.source === 'pdf' && q.num ? { label: String(q.num) } : {}), stem: q.stem || '', choices, answer: (q.correct !== null && q.correct !== undefined && q.correct < choices.length) ? LET[q.correct] : '', points: q.points || 1 };
+      const o = { id: U.uid('q_'), ...((imp.source === 'pdf' || imp.fromPdf) && q.num ? { label: String(q.num) } : {}), stem: q.stem || '', choices, answer: (q.correct !== null && q.correct !== undefined && q.correct < choices.length) ? LET[q.correct] : '', points: q.points || 1 };
       if (q.look) { o.look = { stem: q.look.stem || null, choices: q.look.choices.slice(0, 5) }; while (o.look.choices.length < choices.length) o.look.choices.push(null); o.useText = !!q.useText; }
       if (q.imgs) o.imgs = q.imgs;
       if (q.choiceImgs) o.choiceImgs = q.choiceImgs.slice(0, 5);
@@ -1011,12 +1060,11 @@ const Maker = (() => {
     };
     exam.sa = imp.sa.map(saOf);
     // multiple-choice questions the teacher turned into written questions: the original question becomes the prompt picture
-    imp.mc.filter(q => kindOf(q) === 'written').forEach(q => exam.sa.push(saOf({ prompt: [q.stem, ...q.choices.map((c, k) => LET[k] + '. ' + c)].join('\n'), points: q.points || 5, img: q.look ? stackLook(q.look) : null })));
+    imp.mc.filter(q => kindOf(q) === 'written').forEach(q => exam.sa.push(saOf({ prompt: [q.stem, ...q.choices.map((c, k) => LET[k] + '. ' + c)].join('\n'), points: q.points || 5, imgs: q.imgs || [] })));
     const pages = (imp.pages || []).filter(p => p.img);
     pages.filter(p => p.kind === 'written').forEach(p => exam.sa.push({ id: U.uid('s_'), kind: 'page', prompt: p.caption || 'Written page', img: p.img, max: +p.points > 0 ? +p.points : 10, lines: 0, comments: [], key: '', modelAnswer: '', rubric: '', srcPage: p.page }));
     exam.refPages = pages.filter(p => p.kind === 'reference').map(p => ({ id: U.uid('r_'), img: p.img, caption: p.caption || '', srcPage: p.page }));
     exam.frontPages = pages.filter(p => p.kind === 'extra').map(p => ({ id: U.uid('f_'), img: p.img, caption: p.caption || '', srcPage: p.page }));
-    if (imp.look) exam.keepLook = true;
     return exam;
   }
 

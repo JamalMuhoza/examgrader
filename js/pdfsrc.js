@@ -143,11 +143,13 @@ const PdfSrc = (() => {
       if (end !== null && gap > Math.max(1, it.h * 0.15) && !/\s$/.test(s) && !/^\s/.test(it.str)) s += gap > 24 ? '   ' : ' ';
       let t = it.str;
       if (ln && it.h < ln.size * 0.85) {
-        if (ln.base - it.y > ln.size * 0.12) t = script(t, SUP, '^');
-        else if (it.y - ln.base > ln.size * 0.04) t = script(t, SUB, '_');
+        if (ln.base - it.y > ln.size * 0.12) t = t.trim() ? '^{' + t.trim() + '}' : t;
+        else if (it.y - ln.base > ln.size * 0.04) t = t.trim() ? '_{' + t.trim() + '}' : t;
       }
       s += t; end = it.x + it.w;
     }
+    // neighbouring raised (or lowered) pieces are one superscript: 10^{-}^{2} -> 10^{-2}
+    for (let k = 0; k < 4; k++) s = s.replace(/\^\{([^{}]*)\}\^\{([^{}]*)\}/g, '^{$1$2}').replace(/_\{([^{}]*)\}_\{([^{}]*)\}/g, '_{$1$2}');
     return s.replace(/\s+/g, ' ').trim();
   }
 
@@ -351,6 +353,47 @@ const PdfSrc = (() => {
     return { canvas: out, top: (y + my0) / K, left: (x + mx0) / K };
   }
 
+  const area_ = b => Math.max(0, b.x1 - b.x0) * Math.max(0, b.y1 - b.y0);
+  const overlap = (a, b) => area_({ x0: Math.max(a.x0, b.x0), y0: Math.max(a.y0, b.y0), x1: Math.min(a.x1, b.x1), y1: Math.min(a.y1, b.y1) });
+  const near = (a, b, d) => a.x0 - d < b.x1 && b.x0 - d < a.x1 && a.y0 - d < b.y1 && b.y0 - d < a.y1;
+  const union = (...bs) => ({ x0: Math.min(...bs.map(b => b.x0)), y0: Math.min(...bs.map(b => b.y0)), x1: Math.max(...bs.map(b => b.x1)), y1: Math.max(...bs.map(b => b.y1)) });
+  // groups of ink in an area (pt) once all text and pictures are painted white: the drawings
+  function vectorClusters(src, rect, whites) {
+    const x = Math.max(0, Math.floor(rect.x0 * K)), y = Math.max(0, Math.floor(rect.y0 * K));
+    const w = Math.min(src.width - x, Math.ceil((rect.x1 - rect.x0) * K)), h = Math.min(src.height - y, Math.ceil((rect.y1 - rect.y0) * K));
+    if (w < 4 || h < 4) return [];
+    const c = document.createElement('canvas'); c.width = w; c.height = h;
+    const ctx = c.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(src, x, y, w, h, 0, 0, w, h);
+    ctx.fillStyle = '#fff';
+    whites.forEach(b => ctx.fillRect(b.x0 * K - x - 2, b.y0 * K - y - 2, (b.x1 - b.x0) * K + 4, (b.y1 - b.y0) * K + 4));
+    const g = grayOf(ctx, 0, 0, w, h);
+    const S = 3, mw = Math.ceil(w / S), mh = Math.ceil(h / S), m = new Uint8Array(mw * mh);
+    for (let yy = 0; yy < h; yy++) for (let xx = 0; xx < w; xx++) if (g[yy * w + xx] < 170) m[((yy / S) | 0) * mw + ((xx / S) | 0)] = 1;
+    const seen = new Uint8Array(mw * mh), boxes = [];
+    for (let i = 0; i < mw * mh; i++) {
+      if (!m[i] || seen[i]) continue;
+      const st = [i]; seen[i] = 1; let x0 = mw, x1 = 0, y0 = mh, y1 = 0, n = 0;
+      while (st.length) {
+        const q = st.pop(), qx = q % mw, qy = (q - qx) / mw; n++;
+        if (qx < x0) x0 = qx; if (qx > x1) x1 = qx; if (qy < y0) y0 = qy; if (qy > y1) y1 = qy;
+        for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+          const nx = qx + dx, ny = qy + dy; if (nx < 0 || ny < 0 || nx >= mw || ny >= mh) continue;
+          const k = ny * mw + nx; if (m[k] && !seen[k]) { seen[k] = 1; st.push(k); }
+        }
+      }
+      if (n < 2) continue;
+      boxes.push({ x0: (x + x0 * S) / K, y0: (y + y0 * S) / K, x1: (x + (x1 + 1) * S) / K, y1: (y + (y1 + 1) * S) / K });
+    }
+    // drawings are often several strokes: merge pieces that are close
+    let merged = true;
+    while (merged) {
+      merged = false;
+      for (let a = 0; a < boxes.length && !merged; a++) for (let b = a + 1; b < boxes.length; b++) if (near(boxes[a], boxes[b], 5)) { boxes[a] = union(boxes[a], boxes[b]); boxes.splice(b, 1); merged = true; break; }
+    }
+    return boxes.filter(b => b.x1 - b.x0 >= 2 && b.y1 - b.y0 >= 2);
+  }
+
   function encode(canvas) {
     const big = canvas.width * canvas.height > 600000;
     if (!big) return canvas.toDataURL('image/png');
@@ -370,6 +413,11 @@ const PdfSrc = (() => {
       let y = 0; parts.forEach(p => { ctx.drawImage(p.canvas, 0, y); y += p.canvas.height + gap; });
     }
     return { src: encode(c), w: c.width, h: c.height, wpt: c.width / K, hpt: c.height / K, base: base === null || base === undefined ? null : Math.max(0, base - parts[0].top), center: !!center };
+  }
+
+  // several figures of one choice: one picture
+  function stackFigs(list) {
+    return Object.assign({}, list[0], { more: list.slice(1) });
   }
 
   // ---------------- main ----------------
@@ -479,6 +527,7 @@ const PdfSrc = (() => {
     // ---- render each page, refine label splits, cut the crops ----
     const pageInfo = [], pageItems = [], unused = [];
     const crops = new Map();          // region -> [part]
+    const figOut = new Map();         // region -> [figure crop]
     const regionBase = new Map();
     const addPart = (reg, part, base, center) => { if (!part) return; if (!crops.has(reg)) crops.set(reg, []); crops.get(reg).push(part); if (!regionBase.has(reg)) regionBase.set(reg, { base, center }); };
     let firstQPage = Q.length ? Math.min(...Q.map(R => R.q.page)) : null;
@@ -495,7 +544,7 @@ const PdfSrc = (() => {
       // thumbnail
       const tw = 300, th = Math.round(300 * cv.height / cv.width);
       const tc = document.createElement('canvas'); tc.width = tw; tc.height = th; tc.getContext('2d').drawImage(cv, 0, 0, tw, th);
-      const info = { no: p.no, w: p.w, h: p.h, thumb: tc.toDataURL('image/jpeg', 0.75), chars: p.chars, kind: null };
+      const info = { no: p.no, w: p.w, h: p.h, thumb: tc.toDataURL('image/jpeg', 0.75), chars: p.chars, kind: null, text: p.lines.filter(l => !l.furniture && l.text).map(l => l.text).join('\n') };
       pageInfo.push(info);
       const regs = Q.filter(R => R.q.lines.some(l => l.page === p.no));
       // refine "A) text" splits with the pixels
@@ -514,44 +563,88 @@ const PdfSrc = (() => {
       p.images.forEach(im => all.push({ b: im, owner: im.owner || 'other', img: true }));
       const textX0 = Math.max(inner.x0, Math.min(...p.lines.map(l => l.x0), ...p.images.map(i => i.x0)) - 3);
       const textX1 = Math.min(inner.x1, Math.max(...p.lines.map(l => l.x1), ...p.images.map(i => i.x1)) + 6);
-      regs.forEach((R, ri) => {
+      // ---- figures: pictures, drawings and stacked glyph arrangements; everything else stays text ----
+      const textBoxes = p.items.filter(it => !it.rot).map(it => ({ x0: it.x, x1: it.x + it.w, y0: it.y - it.h * 0.8, y1: it.y + it.h * 0.3 }));
+      regs.forEach(R => {
         const ls = R.q.lines.filter(l => l.page === p.no);
+        if (!ls.length) return;
         const nextR = Q[Q.indexOf(R) + 1];
         const nls = nextR ? nextR.q.lines.filter(l => l.page === p.no) : [];
-        const qEnd = nls.length ? Math.min(...nls.map(l => l.top)) - 1 : Math.min(inner.y1, Math.max(...ls.map(l => l.bottom), ...[R.stem, ...R.choices].flatMap(r => r.imgs.filter(i => i.page === p.no).map(i => i.y1))) + 6);
+        const qTop = Math.min(...ls.map(l => l.top)) - 2;
+        const qEnd = nls.length ? Math.min(...nls.map(l => l.top)) - 1 : Math.min(inner.y1, Math.max(...ls.map(l => l.bottom), ...[R.stem, ...R.choices].flatMap(r => r.imgs.filter(i => i.page === p.no).map(i => i.y1))) + 24);
         const regions = [R.stem, ...R.choices];
-        const ownBoxes = reg => R.pieces.filter(pc => pc.owner === reg && pc.line.page === p.no).map(boxOf).concat(reg.imgs.filter(i => i.page === p.no));
-        const lblLines = R.choices.map(c => c.label).filter(l => R.q.lines[l.line].page === p.no);
-        const xs = lblLines.map(l => l.x).sort((a, b) => a - b);
-        const cols = []; xs.forEach(x => { if (!cols.length || x - cols[cols.length - 1] > 15) cols.push(x); });
+        const piecesOf = reg => R.pieces.filter(pc => pc.owner === reg && pc.line.page === p.no);
+        const lbls = R.choices.map(c => c.label).filter(l => R.q.lines[l.line].page === p.no);
+        const firstChoiceTop = lbls.length ? Math.min(...lbls.map(l => { const ln = R.q.lines[l.line]; return ln.base - ln.size * 0.75; })) : 1e9;
+        const regionAt = (cx, cy) => {
+          if (cy < firstChoiceTop) return R.stem;
+          const xs = lbls.map(l => l.x).sort((a, b) => a - b);
+          const before = lbls.filter(l => R.q.lines[l.line].base - R.q.lines[l.line].size <= cy);
+          const inCol = before.filter(l => { const nx = xs.find(x => x > l.x + 15); return cx >= l.x - 6 && (nx === undefined || cx < nx - 3); });
+          const lab = inCol.pop() || before.pop();
+          return lab ? R.choices[R.labels.indexOf(lab)] : R.stem;
+        };
+        const figs = new Map();   // region -> [{ box, absorb: [pieces], img }]
+        const addFig = (reg, f) => { if (!figs.has(reg)) figs.set(reg, []); figs.get(reg).push(f); };
+        // 1) pictures (raster images) that belong to a region
+        regions.forEach(reg => reg.imgs.filter(i => i.page === p.no).forEach(im => addFig(reg, { box: { x0: im.x0, y0: im.y0, x1: im.x1, y1: im.y1 }, absorb: [], raster: true })));
+        // 2) glyph arrangements: two or more stacked short non-prose lines inside one region (structures typed with letters, dots, dashes)
         regions.forEach(reg => {
-          const own = ownBoxes(reg);
-          if (!own.length) return;
-          const ox0 = Math.min(...own.map(b => b.x0)), oy0 = Math.min(...own.map(b => b.y0)), oy1 = Math.max(...own.map(b => b.y1));
-          let x0 = ox0 - 2, x1 = textX1, y0 = oy0 - 1, y1;
-          if (reg === R.stem) {
-            // a drawing under the stem may reach down beside the first choice: the band ends at the first choice's letters, not its line box
-            const firstChoiceTop = lblLines.length ? Math.min(...R.choices.filter(c => R.q.lines[c.label.line].page === p.no).map(c => { const ln = R.q.lines[c.label.line]; return Math.min(ln.base - ln.size * 0.55, ...c.imgs.filter(i => i.page === p.no).map(i => i.y0)); })) : qEnd;
-            y1 = Math.max(oy1 + 1, Math.min(firstChoiceTop, qEnd));
-            if (lblLines.length && R.q.lines[R.choices[0].label.line].page === p.no && R.choices[0].label.line === R.q.lines.indexOf(ls[ls.length - 1]) && false) y1 = oy1 + 1;
-          } else {
-            const lab = reg.label, ci = cols.findIndex(c => Math.abs(c - lab.x) <= 15);
-            x0 = Math.min(x0, (lab.piece ? lab.piece.x1 : lab.xe) - 1);
-            if (ci >= 0 && ci + 1 < cols.length) x1 = cols[ci + 1] - 3;
-            // a choice is as wide as its own text and pictures (keeps a neighbouring drawing out of it)
-            x1 = Math.min(x1, Math.max(...own.map(b => b.x1)) + 8);
-            const sameCol = R.choices.filter(c => c !== reg && R.q.lines[c.label.line].page === p.no && Math.abs(c.label.x - lab.x) <= 15 && (c.label.line > lab.line));
-            const nextTop = sameCol.length ? Math.min(...sameCol.map(c => Math.min(R.q.lines[c.label.line].top, ...c.imgs.filter(i => i.page === p.no).map(i => i.y0)))) : qEnd;
-            y1 = Math.max(oy1 + 1, nextTop);
-            y0 = Math.min(y0, R.q.lines[lab.line].page === p.no ? R.q.lines[lab.line].top - 1 : y0);
-          }
-          const others = all.filter(a => a.owner !== reg).map(a => a.b);
-          const part = cutOut(cv, { x0, y0, x1, y1 }, own.filter(b => !b.img), others, {});
-          // baseline of the first own text line (for aligning the number or bubble)
-          const tl = R.pieces.filter(pc => pc.owner === reg && pc.line.page === p.no).map(pc => pc.line);
-          const base = tl.length ? Math.min(...tl.map(l => l.base)) : null;
-          const center = reg !== R.stem && reg.imgs.length > 0;
-          addPart(reg, part, base, center);
+          const byLine = new Map();
+          piecesOf(reg).forEach(pc => { if (!byLine.has(pc.line)) byLine.set(pc.line, []); byLine.get(pc.line).push(pc); });
+          const rows = [...byLine.entries()].sort((a, b) => a[0].base - b[0].base);
+          const isGlyph = pcs => { const t = pcs.map(pc => pc.s).join(' ').replace(/\s+/g, ' ').trim(); return t.replace(/\s/g, '').length <= 14 && !/[a-z]{4,}/.test(t) && !/^\d{1,3}\s*[.)]/.test(t) && !/[?]$/.test(t); };
+          let run = [];
+          const flush = () => {
+            if (run.length >= 2) {
+              const ab = run.flatMap(r => r[1]);
+              addFig(reg, { box: { x0: Math.min(...ab.map(pc => pc.x0)), x1: Math.max(...ab.map(pc => pc.x1)), y0: Math.min(...ab.map(pc => pc.it.y - pc.it.h * 0.8)), y1: Math.max(...ab.map(pc => pc.it.y + pc.it.h * 0.3)) }, absorb: ab, glyph: true });
+            }
+            run = [];
+          };
+          rows.forEach(r => { if (isGlyph(r[1]) && (!run.length || r[0].top - run[run.length - 1][0].bottom < r[0].size * 1.6)) run.push(r); else { flush(); if (isGlyph(r[1])) run.push(r); } });
+          flush();
+        });
+        // 3) drawings: ink that is not text and not a picture
+        const area = { x0: textX0, y0: qTop, x1: textX1, y1: qEnd };
+        const taken = [...figs.values()].flat().map(f => f.box);
+        const clusters = vectorClusters(cv, area, textBoxes.concat(p.images.map(im => ({ x0: im.x0, y0: im.y0, x1: im.x1, y1: im.y1 }))));
+        clusters.forEach(cb => {
+          if (taken.some(t => overlap(t, cb) > 0.5 * area_(cb))) return;
+          // part of a glyph arrangement (bond lines between letters)
+          const gf = [...figs.values()].flat().find(f => f.glyph && near(f.box, cb, 6));
+          if (gf) { gf.box = union(gf.box, cb); return; }
+          if (cb.x1 - cb.x0 < 8 || cb.y1 - cb.y0 < 8) return;
+          const reg = regionAt((cb.x0 + cb.x1) / 2, (cb.y0 + cb.y1) / 2);
+          const inside = piecesOf(reg).filter(pc => { const cx = (pc.x0 + pc.x1) / 2, cy = pc.it.y - pc.it.h * 0.3; return cx > cb.x0 - 3 && cx < cb.x1 + 3 && cy > cb.y0 - 3 && cy < cb.y1 + 3; });
+          const all_ = piecesOf(reg).reduce((a, pc) => a + pc.s.trim().length, 0), inn = inside.reduce((a, pc) => a + pc.s.trim().length, 0);
+          if (inn > 0.3 * all_ && inn > 12) return;      // a frame around the question text, not a figure
+          addFig(reg, { box: inside.length ? union(cb, ...inside.map(pc => ({ x0: pc.x0, x1: pc.x1, y0: pc.it.y - pc.it.h * 0.8, y1: pc.it.y + pc.it.h * 0.3 }))) : cb, absorb: inside, drawing: true });
+        });
+        // cut each figure out at full resolution (text of other parts painted white)
+        figs.forEach((list, reg) => {
+          list.sort((a, b) => a.box.y0 - b.box.y0 || a.box.x0 - b.box.x0);
+          list.forEach(f => {
+            f.absorb.forEach(pc => { pc.figure = true; });
+            const ownB = f.absorb.map(boxOf);
+            const others = all.filter(a => !a.img && !f.absorb.some(pc => boxOf(pc).x0 === a.b.x0 && boxOf(pc).y0 === a.b.y0)).map(a => a.b)
+              .concat(p.images.filter(im => !(Math.abs(im.x0 - f.box.x0) < 0.5 && Math.abs(im.y0 - f.box.y0) < 0.5) && !(im.x0 >= f.box.x0 - 1 && im.x1 <= f.box.x1 + 1 && im.y0 >= f.box.y0 - 1 && im.y1 <= f.box.y1 + 1)).map(im => ({ ...im, img: true })));
+            const b = f.box, pad = f.raster ? 0.5 : 2;
+            const part = cutOut(cv, { x0: b.x0 - pad, y0: b.y0 - pad, x1: b.x1 + pad, y1: b.y1 + pad }, ownB, f.raster ? [] : others, {});
+            if (!part) return;
+            f.part = part;
+          });
+          // a choice gets one picture (several pieces stacked); the stem keeps each figure
+          const done = list.filter(f => f.part);
+          const groups = reg === R.stem ? done.map(f => [f]) : (done.length ? [done] : []);
+          groups.forEach(gr => {
+            const crop = finishCrop(gr.map(f => f.part));
+            const f = gr[0], b = union(...gr.map(x => x.box));
+            crop.kind = f.raster ? 'picture' : f.glyph ? 'glyphs' : 'drawing';
+            crop.page = p.no; crop.box = { x0: Math.round(b.x0), y0: Math.round(b.y0), x1: Math.round(b.x1), y1: Math.round(b.y1) };
+            if (!figOut.has(reg)) figOut.set(reg, []);
+            figOut.get(reg).push(crop);
+          });
         });
       });
       // ---- non-question content on this page: listed under "Not used" by default (the teacher can opt in) ----
@@ -614,7 +707,7 @@ const PdfSrc = (() => {
       const fin = reg => { const parts = crops.get(reg) || []; const rb = regionBase.get(reg) || {}; return finishCrop(parts, rb.base, rb.center); };
       const textOf = reg => {
         const byLine = new Map();
-        R.pieces.filter(pc => pc.owner === reg).forEach(pc => { if (!byLine.has(pc.line)) byLine.set(pc.line, []); byLine.get(pc.line).push(pc); });
+        R.pieces.filter(pc => pc.owner === reg && !pc.figure).forEach(pc => { if (!byLine.has(pc.line)) byLine.set(pc.line, []); byLine.get(pc.line).push(pc); });
         const out = [];
         byLine.forEach((pcs, ln) => {
           const items = pcs.map(pc => ({ ...pc.it, str: pc.it.str.slice(pc.a, pc.b), x: pc.x0, w: pc.x1 - pc.x0 }));
@@ -622,11 +715,11 @@ const PdfSrc = (() => {
         });
         return out.reduce((s, t) => !s ? t : /[A-Za-z]-$/.test(s) ? s + t : s + ' ' + t, '').replace(/\s+/g, ' ').trim();
       };
-      const look = { stem: fin(R.stem), choices: R.choices.map(fin) };
-      const hasImg = R.stem.imgs.length > 0;
+      const stemFigs = figOut.get(R.stem) || [];
+      const chFigs = R.choices.map(c => (figOut.get(c) || [])[0] || null);
       return {
-        num: R.num, page: R.q.page, odd: R.q.odd, stem: textOf(R.stem), choices: R.choices.map(c => textOf(c) || (c.imgs.length ? '[picture]' : '')), look,
-        imgChoices: R.choices.map(c => c.imgs.length > 0), stemImg: hasImg, markedChoice: R.choices.findIndex(c => c.marked)
+        num: R.num, page: R.q.page, odd: R.q.odd, stem: textOf(R.stem), choices: R.choices.map(textOf), stemFigs, choiceFigs: chFigs,
+        markedChoice: R.choices.findIndex(c => c.marked)
       };
     });
     const hid = pages.reduce((a, p) => a + p.hidden, 0);
