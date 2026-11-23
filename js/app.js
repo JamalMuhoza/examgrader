@@ -1643,8 +1643,8 @@
     const cloudMsg = el('span', { class: 'small', id: 'cloudMsg' });
     v.appendChild(el('div', { class: 'card' }, el('h3', {}, 'Google Drive / Sheets (optional)'),
       el('p', { class: 'small muted' }, 'Deploy the provided Apps Script (server/Code.gs) as a web app, then paste its URL and the shared token here. Without it, everything stays on this device.'),
-      field('Apps Script web app URL', sInp('cloudUrl', { id: 's_cloudUrl', placeholder: 'https://script.google.com/macros/s/.../exec' })),
-      field('Shared token', sInp('cloudToken', { id: 's_cloudToken', type: 'password' })),
+      field('Apps Script web app URL', sInp('cloudUrl', { id: 's_cloudUrl', autocomplete: 'off', name: 'eg-server-url', placeholder: 'https://script.google.com/macros/s/.../exec' })),
+      field('Shared token', sInp('cloudToken', { id: 's_cloudToken', type: 'password', autocomplete: 'new-password', name: 'eg-shared-token' })),
       el('div', { class: 'row' }, el('button', { class: 'btn', id: 'btnPing', onclick: async () => {
         cloudMsg.textContent = 'Testing...';
         try { const r = await Export.cloudPost(st.cloudUrl, st.cloudToken, { action: 'ping' }); cloudMsg.textContent = 'Connected: ' + (r.message || 'ok'); }
