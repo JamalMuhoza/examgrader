@@ -7,7 +7,8 @@
  *   { token, action: 'saveGrades', exam: {id,title,...}, header: [...], rows: [[...], ...] }
  *   { token, action: 'aiModels' }
  *   { token, action: 'aiGrade', model, prompt, maxPoints, answerKey, rubric, presetComments: [...],
- *     examples: [{ imageB64, points, comment }], imageB64 }
+ *     examples: [{ imageB64, points, comment }], imageB64, keyImageB64 }
+ *   keyImageB64 (optional): the teacher's answer-key copy of the same answer box (model answer + rubric written in it).
  * Responses: JSON { ok: true, ... } or { ok: false, error }.
  *
  * Script properties (Project Settings > Script properties):
@@ -143,10 +144,11 @@ function aiModels_() {
 }
 
 var AI_RULES = [
-  'You are assisting a teacher who grades handwritten answers on paper exams. Your output is only a suggestion; the teacher reviews every item.',
+  'You are assisting a teacher who grades handwritten answers on paper exams. Your grade is applied as a draft grade; the teacher can review and correct it before approving.',
+  'If an ANSWER KEY AND RUBRIC image is given, it is the teacher\'s own key copy of this answer box: it contains the model answer and the grading rubric (points per element). Read it first and grade the student answer against it; it takes precedence over any typed answer key or rubric. Award points only for what the student wrote in the student image, never for the content of the key image itself.',
   'Grade ONLY what is actually written in the answer image. Do not give credit for ideas the student did not write, and do not guess or infer text you cannot read.',
   'If the answer is blank, crossed out entirely, or unreadable, set legible=false, points=0, confidence="low" and say so briefly in the comment.',
-  'Use the rubric: award each rubric element only when it is clearly present. points must equal the sum of rubricItems earned, between 0 and the maximum, in steps of 0.5.',
+  'Use the rubric (from the key image and/or the typed rubric): award each rubric element only when it is clearly present. points must equal the sum of rubricItems earned, between 0 and the maximum, in steps of 0.5.',
   'Be aware of chemistry and biochemistry notation: subscripts and superscripts (H2O, Ca2+, 10^-5), charges, arrows (->, <=>), states (s), (l), (g), (aq), significant figures, units, structural sketches, graphs with labelled axes. Accept equivalent correct notation; check units and balancing when the rubric asks for them.',
   'comment: one short sentence in the teacher\'s voice addressed to the student (at most about 12 words). If one of the preset comments fits, use it exactly, word for word.',
   'confidence: "high" only when the handwriting is clear and the rubric applies unambiguously; otherwise "medium" or "low".',
@@ -177,11 +179,12 @@ function aiGrade_(req) {
   var max = Math.max(0, Number(req.maxPoints) || 0);
   var gemma = /gemma/i.test(model);
   var presets = (req.presetComments || []).map(String).filter(function (c) { return c.trim(); }).slice(0, 30);
+  var keyImg = req.keyImageB64 ? String(req.keyImageB64) : '';
   var ctx = [
     'QUESTION: ' + String(req.prompt || '(not given)'),
     'MAXIMUM POINTS: ' + max,
-    'ANSWER KEY / MODEL ANSWER: ' + (String(req.answerKey || '').trim() || '(none given; use your subject knowledge)'),
-    'RUBRIC: ' + (String(req.rubric || '').trim() || '(none given; award points for correctness and completeness)'),
+    'ANSWER KEY / MODEL ANSWER: ' + (String(req.answerKey || '').trim() || (keyImg ? '(see the ANSWER KEY AND RUBRIC image)' : '(none given; use your subject knowledge)')),
+    'RUBRIC: ' + (String(req.rubric || '').trim() || (keyImg ? '(see the ANSWER KEY AND RUBRIC image)' : '(none given; award points for correctness and completeness)')),
     'PRESET COMMENTS: ' + (presets.length ? presets.map(function (c) { return '"' + c + '"'; }).join('; ') : '(none)')
   ].join('\n');
   var parts = [];
@@ -194,7 +197,11 @@ function aiGrade_(req) {
     parts.push({ text: 'TEACHER-GRADED EXAMPLE ' + (i + 1) + ': the teacher gave ' + Number(ex.points) + ' / ' + max + ' points' + (ex.comment ? ' with the comment "' + String(ex.comment) + '"' : '') + '.' });
     parts.push({ inline_data: { mime_type: 'image/jpeg', data: String(ex.imageB64) } });
   });
-  parts.push({ text: 'STUDENT ANSWER TO GRADE (image of the answer box only):' });
+  if (keyImg) {
+    parts.push({ text: 'ANSWER KEY AND RUBRIC written by the teacher (image of the teacher\'s key copy of this answer box: the model answer and the points for each rubric element). This is NOT the student answer:' });
+    parts.push({ inline_data: { mime_type: 'image/jpeg', data: keyImg } });
+  }
+  parts.push({ text: 'STUDENT ANSWER TO GRADE (image of the student\'s answer box only; grade this image against the answer key and rubric):' });
   parts.push({ inline_data: { mime_type: 'image/jpeg', data: String(req.imageB64) } });
 
   var body = { contents: [{ role: 'user', parts: parts }], generationConfig: { temperature: 0 } };

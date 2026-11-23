@@ -12,22 +12,22 @@ What it creates:
 2. Replace the contents of `Code.gs` with the file `server/Code.gs` from this folder. Save.
 3. **Project Settings** (gear icon) > **Script properties** > **Add script property**:
    - `TOKEN`: a long random secret (the same text goes into the app).
-   - `GEMINI_KEY`: only if you want AI grading suggestions. Create a free key at https://aistudio.google.com (Get API key) and paste it here. Never put this key in the web app.
+   - `GEMINI_KEY`: only if you want written answers graded automatically by AI. Create a free key at https://aistudio.google.com (Get API key) and paste it here. Never put this key in the web app.
    Click **Save script properties**.
 4. Click **Deploy > New deployment**. Click the gear next to "Select type" and choose **Web app**.
 5. Description: "Exam Grader". **Execute as: Me**. **Who has access: Anyone**. Click **Deploy**.
-6. Click **Authorize access** and allow access for your account (Drive, Sheets, and "Connect to an external service", which the AI suggestions use to reach Google's Gemini API).
+6. Click **Authorize access** and allow access for your account (Drive, Sheets, and "Connect to an external service", which the AI grading uses to reach Google's Gemini API).
 7. Copy the **Web app URL** (ends in `/exec`).
 8. In Exam Grader open **Settings > Google Drive / Sheets**, paste the URL and the same token, then click **Test connection**.
 9. On the **Results** screen use **Save to Google Drive**.
-10. Optional AI suggestions: **Settings > AI suggestions (Google Gemini)** > tick the box > **Test connection and load models**. Leave the model on Automatic unless you want a specific one.
+10. Optional AI grading: **Settings > AI grading of written answers (Google Gemini)** > tick the box > **Test connection and load models**. Leave the model on Automatic unless you want a specific one.
 
-After editing `Code.gs` later, use **Deploy > Manage deployments > Edit (pencil) > Version: New version > Deploy** so the same URL serves the new code. If a new version needs a new permission (for example the AI suggestions after upgrading), run any function once from the editor or re-open the deployment to approve it.
+After editing `Code.gs` later, use **Deploy > Manage deployments > Edit (pencil) > Version: New version > Deploy** so the same URL serves the new code. If a new version needs a new permission (for example the AI grading after upgrading), run any function once from the editor or re-open the deployment to approve it.
 
-## AI suggestions (optional)
+## AI grading (optional)
 
-- The server action `aiModels` lists the Gemini models your key may use; `aiGrade` sends one answer-box image (plus up to 4 teacher-graded example images of the same question, the question, answer key, rubric and preset comments) to `models/<model>:generateContent` and returns points, a rubric breakdown, a short comment, a legibility flag, a confidence level and suggested pen marks.
-- Nothing is saved as a grade until the teacher accepts it in the app.
+- The server action `aiModels` lists the Gemini models your key may use; `aiGrade` sends one student answer-box image (plus, when a key was uploaded, the same box from the teacher's key copy as `keyImageB64`, labelled ANSWER KEY AND RUBRIC; optional teacher-graded example images; the question, typed answer key, rubric and preset comments) to `models/<model>:generateContent` and returns points, a rubric breakdown, a short comment, a legibility flag, a confidence level and suggested pen marks.
+- The app applies each result as a draft grade with red-pen marks; the teacher can correct anything and nothing is final until the teacher approves. Low-confidence and illegible answers are flagged for attention.
 - Free tier: Google limits requests per minute and per day for each model. The app paces itself (12 per minute by default) and stops at a daily limit you set (480 by default). If Google answers "rate limited", the app pauses and resumes.
 - Privacy: on Google's free tier, submitted content may be used by Google to improve its products and may be read by human reviewers. Only the answer-box crop is sent (no name, no ID, no cover page). Check your school's privacy rules before using it.
 
