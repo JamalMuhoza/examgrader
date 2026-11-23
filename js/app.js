@@ -10,9 +10,11 @@
     autoApprove: false
   };
   const VIEWS = [
-    ['exams', 'Exams'], ['setup', 'Setup'], ['print', 'Print'], ['scan', 'Scan'], ['review', 'Review'],
+    ['exams', 'Exams'], ['template', 'Exam template'], ['setup', 'Setup'], ['print', 'Print'], ['scan', 'Scan'], ['review', 'Review'],
     ['grade', 'Grade'], ['results', 'Results'], ['settings', 'Settings'], ['help', 'Help']
   ];
+
+  const SUBVIEWS = { make: 'template', import: 'template' };   // screens reached from Exam template (its menu item stays lit)
 
   // ---------------- boot ----------------
   async function boot() {
@@ -25,7 +27,7 @@
     buildNav();
     renderQ();
     const hv = location.hash.replace('#', '');
-    go(VIEWS.some(v => v[0] === hv) ? hv : (S.exam ? 'scan' : 'exams'));
+    go(VIEWS.some(v => v[0] === hv) || SUBVIEWS[hv] ? hv : (S.exam ? 'scan' : 'exams'));
     if (window.pdfjsLib) pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
     if ('serviceWorker' in navigator && location.protocol !== 'file:' && !window.__NO_SW) {
       navigator.serviceWorker.register('sw.js').catch(() => { });
@@ -60,14 +62,14 @@
     if (S.cam && view !== 'scan') stopCamera();
     S.view = view;
     history.replaceState(null, '', '#' + view);
-    $$('.navbtn').forEach(b => b.classList.toggle('active', b.dataset.view === view));
+    $$('.navbtn').forEach(b => b.classList.toggle('active', b.dataset.view === (SUBVIEWS[view] || view)));
     const v = $('#view'); v.innerHTML = '';
-    const needExam = !['exams', 'settings', 'help'].includes(view);
+    const needExam = !['exams', 'template', 'import', 'settings', 'help'].includes(view);
     if (needExam && !S.exam) {
       v.appendChild(el('div', { class: 'card' }, el('h2', {}, 'No exam selected'), el('p', {}, 'Create or open an exam first.'), el('button', { class: 'btn primary', onclick: () => go('exams') }, 'Go to Exams')));
       return;
     }
-    const fn = { exams: viewExams, setup: viewSetup, print: viewPrint, scan: viewScan, review: viewReview, grade: viewGrade, results: viewResults, settings: viewSettings, help: viewHelp }[view];
+    const fn = { exams: viewExams, template: viewTemplate, make: viewMake, import: viewImport, setup: viewSetup, print: viewPrint, scan: viewScan, review: viewReview, grade: viewGrade, results: viewResults, settings: viewSettings, help: viewHelp }[view];
     Promise.resolve(fn(v)).catch(err => { console.error(err); v.appendChild(el('div', { class: 'card warn' }, 'Error: ' + err.message)); });
   }
 
@@ -165,10 +167,10 @@
     return i;
   }
 
-  function viewSetup(v) {
+  function viewSetup(v, embedded) {
     const e = S.exam;
     const changed = S.scans.length && e.printedSig && e.printedSig !== geomSig(e.layout);
-    v.appendChild(el('div', { class: 'row between' }, el('h2', {}, 'Exam setup'), el('span', { id: 'saveState', class: 'muted small' }, 'Changes save automatically')));
+    if (!embedded) v.appendChild(el('div', { class: 'row between' }, el('h2', {}, 'Exam setup'), el('span', { id: 'saveState', class: 'muted small' }, 'Changes save automatically')));
     if (changed) v.appendChild(el('div', { class: 'card warn' }, 'The layout changed after this exam was printed and scanned. Bubbles may have moved. Reprint, or use "Re-read all scans" on the Scan screen only if the printed papers match the new layout.'));
     const meta = el('div', { class: 'card grid2' },
       field('School / institution', inp(e, 'school', { id: 'f_school' })),
@@ -193,16 +195,18 @@
           el('button', { class: 'btn', id: 'btnAddMC', onclick: () => { e.mc.push({ id: uid('q_'), stem: '', choices: ['', '', '', ''], answer: '', points: 1 }); saveSoon(); renderMC(); } }, 'Add question'),
           el('button', { class: 'btn', onclick: () => bulk.classList.toggle('hidden') }, 'Bulk paste'))));
       const bulk = el('div', { class: 'bulk hidden', id: 'bulkBox' },
-        el('p', { class: 'small muted' }, 'Paste questions. Start each question with its number ("1." or "1)"), each choice with a letter ("A." or "B)"). Put * before the correct choice. Optional answer key string (for example ABDCE...) overrides the stars.'),
+        el('p', { class: 'small muted' }, 'Paste questions in the Exam template format. Start each question with its number ("1." or "1)"), each choice with a letter ("A.", "b)" or "(c)"). Mark the correct choice with * or "(correct)", or add "Answer: C" under the question or an "Answer key" list (1-B 2-C) at the end. Written questions start with "SA1." and may have Key:, Rubric: and Lines: lines. An answer key string (for example ABDCE...) overrides the marks.'),
         el('textarea', { id: 'bulkText', rows: 10, placeholder: '1. Which element has the highest electronegativity?\nA. Oxygen\n*B. Fluorine\nC. Chlorine\nD. Nitrogen' }),
         el('div', { class: 'row wrap' },
           el('input', { id: 'bulkKey', placeholder: 'Answer key string, e.g. ABDCE (optional)' }),
           el('label', { class: 'small' }, el('input', { type: 'checkbox', id: 'bulkReplace' }), ' Replace existing questions'),
           el('button', { class: 'btn primary', id: 'btnBulkAdd', onclick: () => {
             const qs = parseBulk($('#bulkText').value, $('#bulkKey').value);
-            if (!qs.length) { toast('No questions recognised', 'bad'); return; }
-            if ($('#bulkReplace').checked) e.mc = qs; else e.mc.push(...qs);
-            saveSoon(); renderMC(); toast(qs.length + ' questions added');
+            const sa = qs.sa || [];
+            if (!qs.length && !sa.length) { toast('No questions recognised', 'bad'); return; }
+            if ($('#bulkReplace').checked) e.mc = [...qs]; else e.mc.push(...qs);
+            if (sa.length) { e.sa.push(...sa); renderSA(); }
+            saveSoon(); renderMC(); toast(qs.length + ' questions added' + (sa.length ? `, ${sa.length} written` : ''));
           } }, 'Add questions')),
         el('div', { class: 'row wrap' },
           el('input', { id: 'keyOnly', placeholder: 'Apply key string to existing questions, e.g. ABDCEA...' }),
@@ -249,7 +253,7 @@
     v.appendChild(el('div', { class: 'card' }, el('h3', {}, 'Roster (optional)'),
       el('p', { class: 'small muted' }, 'Paste ID,Name lines (CSV). Scanned IDs are matched to names.'), ro,
       el('div', { class: 'row' }, el('button', { class: 'btn', id: 'btnSaveRoster', onclick: async () => { e.roster = Grade.parseRoster(ro.value); await saveExam(false); toast(e.roster.length + ' roster entries saved'); } }, 'Save roster'))));
-    v.appendChild(el('div', { class: 'row' }, el('button', { class: 'btn primary', onclick: async () => { await saveExam(); go('print'); } }, 'Continue to Print')));
+    if (!embedded) v.appendChild(el('div', { class: 'row' }, el('button', { class: 'btn primary', onclick: async () => { await saveExam(); go('print'); } }, 'Continue to Print')));
   }
   const buildNavSoon = (() => { let t; return () => { clearTimeout(t); t = setTimeout(buildNav, 600); }; })();
 
@@ -284,7 +288,19 @@
         el('button', { class: 'btn small danger', onclick: () => { if (confirm('Remove question ' + (i + 1) + '?')) { e.mc.splice(i, 1); saveSoon(); rerender(); } } }, 'Remove')));
   }
 
+  // Bulk paste: the Exam template importer's parser (template format, "1)" / "a)" / "(a)" variants, "*" or "(correct)",
+  // "Answer: C" lines, an "Answer key" list); written questions ("SA1. ...") come back in .sa
   function parseBulk(text, keyStr) {
+    const r = Maker.parse(text);
+    if (r.sa.some(q => q.fromMC)) return parseBulkSimple(text, keyStr);   // keep choice-less items as MC rows, as before
+    const ex = Maker.toExam({}, { mc: r.mc, sa: r.sa, fields: {} });
+    ex.mc.forEach((q, i) => { if (r.mc[i].points === null) q.points = 1; });
+    const k = String(keyStr || '').toUpperCase().replace(/[^A-E]/g, '');
+    k.split('').forEach((c, i) => { if (ex.mc[i]) ex.mc[i].answer = c; });
+    const qs = ex.mc; qs.sa = ex.sa;
+    return qs;
+  }
+  function parseBulkSimple(text, keyStr) {
     const qs = []; let cur = null, lastChoice = -1;
     String(text || '').replace(/\r/g, '').split('\n').forEach(line => {
       const t = line.trim();
@@ -319,27 +335,197 @@
       pf.messages.length ? el('ul', {}, pf.messages.slice(0, 20).map(m => el('li', {}, m))) : null,
       el('p', { class: 'small muted' }, 'Print at 100% / "Actual size" on US Letter paper. Do not use "Fit to page" if your printer offers it; small scaling is tolerated.')));
     v.appendChild(el('div', { class: 'row wrap' },
-      el('button', { class: 'btn primary', id: 'btnTemplatePdf', onclick: async () => {
-        const doc = Layout.buildPDF(e, lay, {});
-        e.printedSig = geomSig(lay); await saveExam(false);
-        U.download(doc.output('blob'), U.safeName(e.title) + ' - exam.pdf');
-      } }, 'Download exam PDF'),
-      el('button', { class: 'btn', id: 'btnKeyPdf', onclick: () => { const doc = Layout.buildPDF(e, lay, { key: true }); U.download(doc.output('blob'), U.safeName(e.title) + ' - answer key.pdf'); } }, 'Download answer key PDF'),
+      el('button', { class: 'btn primary', id: 'btnTemplatePdf', onclick: () => downloadExamPdf() }, 'Download exam PDF'),
+      el('button', { class: 'btn', id: 'btnKeyPdf', onclick: () => downloadKeyPdf() }, 'Download answer key PDF'),
       el('button', { class: 'btn', id: 'btnLayoutJson', onclick: () => U.download(new Blob([JSON.stringify({ exam: e.id, layout: lay }, null, 1)], { type: 'application/json' }), U.safeName(e.title) + ' - layout.json') }, 'Download layout manifest')));
     const prev = el('div', { class: 'thumbs', id: 'printPreview' }, el('p', { class: 'muted' }, 'Rendering preview...'));
     v.appendChild(el('div', { class: 'card' }, el('h3', {}, 'Preview'), prev));
+    await renderTemplateThumbs(prev);
+  }
+
+  // shared by Print and Make exam
+  async function downloadExamPdf() {
+    const e = S.exam;
+    await saveExam();
+    const lay = L();
+    const doc = Layout.buildPDF(e, lay, {});
+    e.printedSig = geomSig(lay); await saveExam(false);
+    U.download(doc.output('blob'), U.safeName(e.title) + ' - exam.pdf');
+  }
+  async function downloadKeyPdf() {
+    await saveExam();
+    const doc = Layout.buildPDF(S.exam, L(), { key: true });
+    U.download(doc.output('blob'), U.safeName(S.exam.title) + ' - answer key.pdf');
+  }
+  let thumbJob = 0;
+  async function renderTemplateThumbs(prev, scale = 0.55) {
+    const job = ++thumbJob;
     try {
-      const doc = Layout.buildPDF(e, lay, {});
+      const doc = Layout.buildPDF(S.exam, L(), {});
       const pdf = await pdfjsLib.getDocument({ data: doc.output('arraybuffer') }).promise;
-      prev.innerHTML = '';
+      const figs = [];
       for (let p = 1; p <= pdf.numPages; p++) {
         const page = await pdf.getPage(p);
-        const vp = page.getViewport({ scale: 0.55 });
+        const vp = page.getViewport({ scale });
         const c = CV.canvasOf(Math.round(vp.width), Math.round(vp.height));
         await page.render({ canvasContext: c.getContext('2d'), viewport: vp }).promise;
-        prev.appendChild(el('figure', { class: 'thumb' }, c, el('figcaption', {}, 'Page ' + p)));
+        figs.push(el('figure', { class: 'thumb' }, c, el('figcaption', {}, 'Page ' + p)));
+        if (job !== thumbJob) return;
       }
+      prev.innerHTML = ''; figs.forEach(f => prev.appendChild(f));
     } catch (err) { prev.innerHTML = ''; prev.appendChild(el('p', { class: 'warntext' }, 'Preview unavailable: ' + err.message)); }
+  }
+
+  // ---------------- Exam template: download a Word template, make an exam here, or upload an existing exam ----------------
+  function aiImportOn() { return aiOn(); }
+  function viewTemplate(v) {
+    v.appendChild(el('h2', {}, 'Exam template'));
+    v.appendChild(el('p', { class: 'muted' }, 'Start here. Type an exam in the app, or bring one you already have; either way you get a printable bubble exam that this app scans and grades.'));
+    const status = el('div', { class: 'small', id: 'impStatus', role: 'status', 'aria-live': 'polite' });
+    const up = el('input', { type: 'file', id: 'tplUpload', class: 'hidden', multiple: true, accept: '.docx,.pdf,.txt,.jpg,.jpeg,.png,application/pdf,text/plain,image/jpeg,image/png,application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      onchange: ev => { const f = Array.from(ev.target.files || []); ev.target.value = ''; if (f.length) importFiles(f, status); } });
+    v.appendChild(el('div', { class: 'tplcards' },
+      el('div', { class: 'card tplcard' },
+        el('h3', {}, 'Download blank template'),
+        el('p', { class: 'small' }, 'A Word file laid out the way the importer reads it: header fields, multiple-choice questions with the correct choice starred, and written questions with points, key, rubric and box size. Fill it in, then use Upload my exam.'),
+        el('a', { class: 'btn', id: 'btnTplDocx', href: 'templates/exam-template.docx', download: 'Exam template.docx' }, 'Download template (.docx)')),
+      el('div', { class: 'card tplcard' },
+        el('h3', {}, 'Make exam'),
+        el('p', { class: 'small' }, 'Type the questions, choices, correct answers and points here, watch the printed pages update, then print. The exam PDF and the answer key are generated for you.'),
+        el('div', { class: 'row wrap' },
+          el('button', { class: 'btn primary', id: 'btnMakeExam', onclick: async () => { const ex = newExam(); S.exam = ex; await saveExam(); await selectExam(ex.id); buildNav(); go('make'); } }, 'Make exam'),
+          S.exam ? el('button', { class: 'btn', id: 'btnMakeCurrent', onclick: () => go('make') }, 'Edit "' + (S.exam.title || 'current exam').slice(0, 28) + '"') : null)),
+      el('div', { class: 'card tplcard' },
+        el('h3', {}, 'Upload my exam'),
+        el('p', { class: 'small' }, 'Word (.docx), PDF, text, or photos of the pages. The questions are copied into the template; you check them before the exam is created. Figures are not copied.'),
+        el('label', { class: 'btn primary', for: 'tplUpload' }, 'Upload my exam', up),
+        el('p', { class: 'small muted' }, aiImportOn() ? 'AI reading is on: scanned pages and unusual layouts are read with Gemini through your server.' : 'Scanned pages and unusual layouts need AI reading (Settings > AI). Typed documents in the template format work without it.'),
+        status)));
+  }
+
+  async function importFiles(files, status) {
+    const say = t => { if (status) status.textContent = t; };
+    try {
+      say('Reading ' + files.map(f => f.name).join(', ') + '...');
+      const src = await Maker.readFiles(files, say);
+      const det = Maker.parse(src.text);
+      docWarnings(det, src);
+      S.imp = { src, det, res: det, ai: null, aiError: '', busy: '' };
+      const n = det.mc.length + det.sa.length;
+      const loose = det.skipped.filter(x => x.why !== 'before the first question').length;
+      const incomplete = n === 0 || src.scanned > 0 || loose >= 5 || (det.mc.length > 0 && det.mc.filter(q => q.choices.length < 2).length > det.mc.length / 2);
+      S.imp.incomplete = incomplete;
+      say('');
+      go('import');
+      if (incomplete && aiImportOn()) await runAiImport();
+    } catch (err) { console.error(err); say('Could not read the file: ' + err.message); toast('Could not read the file', 'bad'); }
+  }
+  function docWarnings(res, src) {
+    if (src.figures) res.warnings.push({ level: 'warn', msg: `The document contains ${src.figures} picture(s) or figure(s). Figures are not copied; add them by hand.` });
+    if (src.scanned && res.source !== 'ai') res.warnings.push({ level: 'warn', msg: `${src.scanned} page(s) are images without a text layer (scans or photos). They can only be read with AI reading` + (aiImportOn() ? '.' : ' (Settings > AI grading > tick the box).') });
+  }
+  async function runAiImport() {
+    const imp = S.imp; if (!imp || imp.busy) return;
+    const st = S.settings, ai = st.ai;
+    imp.busy = 'Starting AI reading...'; imp.aiError = '';
+    const upd = t => { imp.busy = t; const b = $('#impAiStatus'); if (b) b.textContent = t; };
+    if (S.view === 'import') go('import');
+    try {
+      if (!AI.modelOf(ai)) {
+        upd('Loading the model list...');
+        const r = await AI.post(st.cloudUrl, st.cloudToken, { action: 'aiModels' });
+        if (!r.ok) throw new Error(r.error || 'Could not load models');
+        ai.models = r.models || []; await saveSettings();
+      }
+      const res = await Maker.aiRead(imp.src, { post: p => AI.post(st.cloudUrl, st.cloudToken, p), model: AI.modelOf(ai), rpm: ai.rpm, onStatus: upd });
+      docWarnings(res, imp.src);
+      imp.ai = res; imp.res = res;
+    } catch (err) { console.error(err); imp.aiError = err.message; }
+    imp.busy = '';
+    if (S.view === 'import') go('import');
+  }
+
+  function viewImport(v) {
+    const imp = S.imp;
+    if (!imp) { go('template'); return; }
+    const r = imp.res, L_ = Maker.LET;
+    const nKey = r.mc.filter(q => q.correct !== null && q.correct !== undefined).length;
+    const warns = r.warnings.filter(w => w.level !== 'info'), infos = r.warnings.filter(w => w.level === 'info');
+    v.appendChild(el('h2', {}, 'Check the imported questions'));
+    v.appendChild(el('div', { class: 'card', id: 'impSummary' },
+      el('p', {}, el('strong', {}, imp.src.name), el('span', { class: 'muted' }, ' | read by ' + (r.source === 'ai' ? `AI (Gemini, ${r.requests} request${r.requests > 1 ? 's' : ''}): compare with your document` : 'the document parser'))),
+      el('p', { id: 'impCounts' }, `${r.mc.length} multiple choice (${nKey} with the correct answer), ${r.sa.length} written.`),
+      imp.busy ? el('p', { class: 'warntext', id: 'impAiStatus' }, imp.busy) : null,
+      imp.aiError ? el('p', { class: 'warntext', id: 'impAiError' }, 'AI reading failed: ' + imp.aiError) : null,
+      !aiImportOn() && imp.incomplete ? el('p', { class: 'small muted' }, 'Some of this document could not be read automatically. Turn on AI reading in Settings (Apps Script server with a Gemini key) to read scans and unusual layouts, or fix the document using the blank template format.') : null,
+      el('div', { class: 'row wrap' },
+        el('button', { class: 'btn primary', id: 'btnImpCreate', disabled: !(r.mc.length + r.sa.length) || !!imp.busy, onclick: () => createFromImport() }, 'Create exam from this'),
+        aiImportOn() ? el('button', { class: 'btn', id: 'btnImpAI', disabled: !!imp.busy, onclick: () => runAiImport() }, imp.ai ? 'Read again with AI' : 'Use AI to read my exam') : null,
+        imp.ai && r.source === 'ai' ? el('button', { class: 'btn', id: 'btnImpParser', onclick: () => { imp.res = imp.det; go('import'); } }, 'Show document parser result') : null,
+        imp.ai && r.source !== 'ai' ? el('button', { class: 'btn', id: 'btnImpShowAI', onclick: () => { imp.res = imp.ai; go('import'); } }, 'Show AI result') : null,
+        el('button', { class: 'btn', onclick: () => go('template') }, 'Choose another file'))));
+    if (warns.length || infos.length || r.skipped.length) {
+      v.appendChild(el('div', { class: 'card ' + (warns.length ? 'warn' : ''), id: 'impWarnings' },
+        el('h3', {}, warns.length ? `Check these (${warns.length})` : 'Notes'),
+        el('ul', { class: 'warnlist' }, [...warns, ...infos].map(w => el('li', { class: w.level === 'info' ? 'muted' : '' }, w.msg, w.raw ? el('div', { class: 'rawtext' }, w.raw) : null))),
+        r.skipped.length ? el('details', { id: 'impSkipped' }, el('summary', {}, `Text not imported (${r.skipped.length} line${r.skipped.length > 1 ? 's' : ''}): check that no question is in it`),
+          el('ul', { class: 'warnlist' }, r.skipped.map(x => el('li', {}, el('span', { class: 'rawtext' }, x.raw), el('span', { class: 'muted small' }, ' (' + x.why + ')'))))) : null));
+    }
+    const mcBox = el('div', { class: 'card', id: 'impMC' }, el('h3', {}, `Multiple choice (${r.mc.length})`));
+    r.mc.forEach((q, i) => {
+      mcBox.appendChild(el('div', { class: 'impq', 'data-i': i },
+        el('div', { class: 'qnum' }, (i + 1) + '.'),
+        el('div', { class: 'qbody' },
+          el('div', { class: 'impstem' }, q.stem || el('em', { class: 'muted' }, '(no question text)'), q.points ? el('span', { class: 'muted small' }, ` (${U.fmt(q.points)} pt${q.points === 1 ? '' : 's'})`) : null),
+          el('ol', { class: 'impchoices' }, q.choices.map((c, k) => el('li', { class: 'impchoice' + (k === q.correct ? ' correct' : '') + (k >= 5 ? ' over' : '') },
+            el('span', { class: 'bub' }, L_[k] || '?'), el('span', {}, c), k === q.correct ? el('strong', { class: 'oktext' }, ' correct') : null))),
+          q.correct === null || q.correct === undefined ? el('div', { class: 'warntext small nokey' }, 'Correct answer not marked') : null)));
+    });
+    v.appendChild(mcBox);
+    const saBox = el('div', { class: 'card', id: 'impSA' }, el('h3', {}, `Written (${r.sa.length})`));
+    r.sa.forEach((q, i) => {
+      saBox.appendChild(el('div', { class: 'impq sa', 'data-i': i },
+        el('div', { class: 'qnum' }, 'SA' + (i + 1)),
+        el('div', { class: 'qbody' },
+          el('div', { class: 'impstem' }, q.prompt || el('em', { class: 'muted' }, '(no prompt)')),
+          el('div', { class: 'small muted' }, [`${q.points ? U.fmt(q.points) : '5 (default)'} points`, `box ${q.lines || '6 (default)'} lines`].join(' | ')),
+          q.key ? el('div', { class: 'small' }, el('strong', {}, 'Key: '), q.key) : null,
+          q.rubric ? el('div', { class: 'small' }, el('strong', {}, 'Rubric: '), q.rubric) : null)));
+    });
+    v.appendChild(saBox);
+  }
+  async function createFromImport() {
+    const imp = S.imp; if (!imp) return;
+    const ex = Maker.toExam(newExam(), imp.res);
+    S.exam = ex; await saveExam(); await selectExam(ex.id); buildNav();
+    toast(`Exam created: ${ex.mc.length} multiple choice, ${ex.sa.length} written`, 'good');
+    go('make');
+  }
+
+  async function viewMake(v) {
+    const e = S.exam;
+    const pfBox = el('div', { class: 'small', id: 'makePreflight' });
+    const prev = el('div', { class: 'thumbs', id: 'makePreview' }, el('p', { class: 'muted' }, 'Rendering preview...'));
+    const refresh = async () => {
+      await saveExam();
+      const lay = L(), pf = lay.preflight, miss = e.mc.filter(q => !q.answer).length;
+      pfBox.className = 'small ' + (pf.ok ? 'oktext' : 'warntext');
+      pfBox.textContent = `${lay.pageCount} pages, ${e.mc.length} multiple choice, ${e.sa.length} written. ` + (pf.ok ? 'Preflight passed.' : 'Preflight found problems: ' + pf.messages.slice(0, 3).join('; ')) + (miss ? ` ${miss} question(s) have no correct answer.` : '');
+      prev.appendChild(el('p', { class: 'muted small' }, 'Updating...'));
+      await renderTemplateThumbs(prev, 0.5);
+    };
+    v.appendChild(el('div', { class: 'card makebar' },
+      el('div', { class: 'row between' }, el('h2', { class: 'nomargin' }, 'Make exam'), el('span', { id: 'saveState', class: 'muted small' }, 'Changes save automatically')),
+      el('div', { class: 'row wrap' },
+        el('button', { class: 'btn primary', id: 'btnMakePrint', onclick: () => downloadExamPdf() }, 'Print / download exam PDF'),
+        el('button', { class: 'btn', id: 'btnMakeKey', onclick: () => downloadKeyPdf() }, 'Download answer key PDF'),
+        el('button', { class: 'btn', id: 'btnMakeRefresh', onclick: refresh }, 'Refresh preview')),
+      pfBox));
+    const left = el('div', { class: 'makeedit' });
+    const right = el('div', { class: 'makeprev' }, el('div', { class: 'card' }, el('h3', {}, 'Printed pages'), prev));
+    v.appendChild(el('div', { class: 'makegrid' }, left, right));
+    viewSetup(left, true);
+    await refresh();
   }
 
   // ---------------- Scan ----------------
@@ -1742,6 +1928,7 @@
   // ---------------- Help ----------------
   function viewHelp(v) {
     const steps = [
+      ['Make the exam', 'Exam template: download the blank Word template, or click Make exam to type the questions in the app with a live preview of the printed pages, or Upload my exam (Word, PDF, text or page photos) to copy an existing exam into the template. Check the imported questions, then Create exam. Print / download exam PDF gives the bubble exam; Download answer key PDF gives the key. Figures are not copied: add them by hand.'],
       ['Set up exam', 'Exams > New exam. Enter school, course, title, date, version and the number of student-ID digits. Add multiple-choice questions (one by one or with Bulk paste) with points, and written-response questions with maximum points and box height. Typed model answers and rubrics are optional.'],
       ['Print', 'Print > check the preflight result > Download exam PDF. Print at actual size on US Letter.'],
       ['Upload key', 'Take one blank copy, shade the correct bubbles, and write (or type onto the PDF) the model answer and the rubric with points per element inside every written-answer box. Setup or Scan > Upload key (PDF or photos, any page order). The app reads the multiple-choice key from the bubbles and keeps each box as that question\'s key and rubric. Confirm any key answers it could not read. Uploading a new key regrades everything.'],
@@ -1760,6 +1947,6 @@
   }
 
   // expose a small hook for automated tests
-  window.ExamGrader = { S, Q, go, selectExam, parseBulk, gradeOf, renderStudentPages, saveExam, commitBatch, makeScan, approveStudents, runQueue, loadOut: () => loadOut(), genChain: () => GEN.chain, genBusy: () => GEN.busy + (AUTO.set.size ? 1 : 0) };
+  window.ExamGrader = { S, Q, go, selectExam, parseBulk, importFiles, runAiImport, gradeOf, renderStudentPages, saveExam, commitBatch, makeScan, approveStudents, runQueue, loadOut: () => loadOut(), genChain: () => GEN.chain, genBusy: () => GEN.busy + (AUTO.set.size ? 1 : 0) };
   window.addEventListener('DOMContentLoaded', boot);
 })();
