@@ -9,6 +9,9 @@
  *   { token, action: 'aiGrade', model, prompt, maxPoints, answerKey, rubric, presetComments: [...],
  *     examples: [{ imageB64, points, comment }], imageB64, keyImageB64 }
  *   keyImageB64 (optional): the teacher's answer-key copy of the same answer box (model answer + rubric written in it).
+ *   { token, action: 'aiExtract', model, text, images: [jpegB64, ...] (optional, max 8), part, parts }
+ *   Reads exam questions from a teacher's document text and/or page images and returns them verbatim:
+ *   { ok, result: { title, mc: [{ number, stem, choices: [..], correct: index|null, points }], sa: [{ number, prompt, points, key, rubric, lines }] } }
  * Responses: JSON { ok: true, ... } or { ok: false, error }.
  *
  * Script properties (Project Settings > Script properties):
@@ -29,6 +32,7 @@ function doPost(e) {
     // AI actions only call Google's API: no Drive/Sheets writes, so they do not take the lock
     if (req.action === 'aiModels') return out_(aiModels_());
     if (req.action === 'aiGrade') return out_(aiGrade_(req));
+    if (req.action === 'aiExtract') return out_(aiExtract_(req));
     var lock = LockService.getScriptLock();
     lock.waitLock(30000);
     try {
@@ -222,6 +226,92 @@ function aiGrade_(req) {
   var obj = extractJson_(text);
   if (!obj) return { ok: false, error: 'Could not read JSON from the model reply: ' + text.slice(0, 160) };
   return { ok: true, result: normalizeAi_(obj, max), usage: data.usageMetadata || null, model: model };
+}
+
+// ======================= AI reading of a teacher's exam document =======================
+
+var EXTRACT_RULES = [
+  'You copy exam questions from a teacher\'s document into a structured list so they can be printed on a bubble-sheet exam.',
+  'Copy every question VERBATIM: the exact wording, numbers, units and punctuation of the document. Do not rewrite, shorten, summarize, correct, translate or reorder anything. Do not invent questions and do not add questions that are not in the document. Do not answer the questions.',
+  'Keep chemistry and math notation as written (H2O, Ca2+, 10^-5, ->, <=>, (aq), units, significant figures).',
+  'mc: multiple-choice questions in document order. stem = the question text without its number. choices = the answer choices in order, WITHOUT their letter labels (no "A.", "b)"). Keep all choices, even if there are more than 5.',
+  'correct = the 0-based index of the correct choice ONLY if the document marks it (an asterisk, "(correct)", bold or highlighted choice, an "Answer: C" line, or an answer key list). If the correct answer is not marked in the document, set correct to null. Never work out the answer yourself.',
+  'points = the points printed for the question (for example "(2 pts)"), otherwise omit it. number = the question number as printed.',
+  'sa: written / short-answer / essay questions in document order. prompt = the question text without its number. points, key (model answer), rubric and lines (answer-box height) only when the document gives them; otherwise omit them.',
+  'Ignore names/ID lines, page headers and footers, and general directions. title = the exam title if the document shows one.',
+  'The document may arrive in several parts; this request holds one part. A question cut off at the start or end of a part: copy the part that is present.'
+].join('\n');
+
+var EXTRACT_SCHEMA = {
+  type: 'OBJECT',
+  properties: {
+    title: { type: 'STRING' },
+    mc: { type: 'ARRAY', items: { type: 'OBJECT', properties: {
+      number: { type: 'STRING' }, stem: { type: 'STRING' }, choices: { type: 'ARRAY', items: { type: 'STRING' } },
+      correct: { type: 'INTEGER', nullable: true }, points: { type: 'NUMBER' } }, required: ['stem', 'choices', 'correct'] } },
+    sa: { type: 'ARRAY', items: { type: 'OBJECT', properties: {
+      number: { type: 'STRING' }, prompt: { type: 'STRING' }, points: { type: 'NUMBER' }, key: { type: 'STRING' },
+      rubric: { type: 'STRING' }, lines: { type: 'INTEGER' } }, required: ['prompt'] } }
+  },
+  required: ['mc', 'sa']
+};
+
+function aiExtract_(req) {
+  var key = geminiKey_();
+  var model = String(req.model || '').replace(/^models\//, '');
+  if (!/^[\w.\-]+$/.test(model)) return { ok: false, error: 'No valid model name given' };
+  var text = String(req.text || '');
+  var images = (req.images || []).map(String).filter(function (s) { return s; }).slice(0, 8);
+  if (!text.trim() && !images.length) return { ok: false, error: 'text or images are required' };
+  if (text.length > 60000) return { ok: false, error: 'text is too long for one request (max 60000 characters); send it in parts' };
+  var gemma = /gemma/i.test(model);
+  var part = Number(req.part) || 1, parts = Number(req.parts) || 1;
+  var p = [];
+  if (gemma) p.push({ text: EXTRACT_RULES + '\n\nReply with ONLY one JSON object, no other text: {"title": string, "mc": [{"number": string, "stem": string, "choices": [string], "correct": number|null, "points": number}], ' +
+    '"sa": [{"number": string, "prompt": string, "points": number, "key": string, "rubric": string, "lines": number}]}' });
+  if (text.trim()) p.push({ text: 'EXAM DOCUMENT TEXT (part ' + part + ' of ' + parts + '):\n' + text });
+  images.forEach(function (b64, i) {
+    p.push({ text: 'EXAM PAGE IMAGE ' + (i + 1) + ' of ' + images.length + ' (part ' + part + ' of ' + parts + '):' });
+    p.push({ inline_data: { mime_type: 'image/jpeg', data: b64 } });
+  });
+  var body = { contents: [{ role: 'user', parts: p }], generationConfig: { temperature: 0 } };
+  if (!gemma) {
+    body.systemInstruction = { parts: [{ text: EXTRACT_RULES }] };
+    body.generationConfig.responseMimeType = 'application/json';
+    body.generationConfig.responseSchema = EXTRACT_SCHEMA;
+  }
+  var res = UrlFetchApp.fetch(GEMINI_BASE + 'models/' + model + ':generateContent?key=' + encodeURIComponent(key), {
+    method: 'post', contentType: 'application/json', payload: JSON.stringify(body), muteHttpExceptions: true
+  });
+  var code = res.getResponseCode(), data = parseJson_(res.getContentText());
+  if (code !== 200) return apiError_(code, data, res);
+  if (data.promptFeedback && data.promptFeedback.blockReason) return { ok: false, error: 'Gemini blocked the request: ' + data.promptFeedback.blockReason };
+  var cand = (data.candidates || [])[0];
+  var out = cand && cand.content && cand.content.parts ? cand.content.parts.map(function (x) { return x.text || ''; }).join('') : '';
+  if (!out) return { ok: false, error: 'Gemini returned no answer' + (cand && cand.finishReason ? ' (finish reason ' + cand.finishReason + ')' : '') };
+  var obj = extractJson_(out);
+  if (!obj) return { ok: false, error: 'Could not read JSON from the model reply' + (cand && cand.finishReason === 'MAX_TOKENS' ? ' (reply too long: try a shorter document part)' : '') + ': ' + out.slice(0, 160) };
+  return { ok: true, result: normalizeExtract_(obj), usage: data.usageMetadata || null, model: model, truncated: !!(cand && cand.finishReason === 'MAX_TOKENS') };
+}
+
+function normalizeExtract_(o) {
+  var str = function (v) { return v === null || v === undefined ? '' : String(v).trim(); };
+  var num = function (v) { v = Number(v); return isFinite(v) && v > 0 ? v : null; };
+  var mc = (Array.isArray(o.mc) ? o.mc : []).map(function (q) {
+    var ch = (Array.isArray(q && q.choices) ? q.choices : []).map(str);
+    // strip letter labels only when every choice carries the next letter in order ("A. ..", "B. ..")
+    var labelled = ch.length > 1 && ch.every(function (c, i) { return new RegExp('^\\(?' + 'ABCDEFGH'.charAt(i) + '\\s*[.)]\\s', 'i').test(c); });
+    if (labelled) ch = ch.map(function (c) { return c.replace(/^\(?[A-H]\s*[.)]\s*/i, ''); });
+    var c = q && q.correct;
+    c = (c === null || c === undefined || c === '' || !isFinite(Number(c))) ? null : Math.round(Number(c));
+    if (c !== null && (c < 0 || c >= ch.length)) c = null;
+    return { number: str(q && q.number), stem: str(q && q.stem), choices: ch, correct: c, points: num(q && q.points) };
+  });
+  var sa = (Array.isArray(o.sa) ? o.sa : []).map(function (q) {
+    var l = Math.round(Number(q && q.lines));
+    return { number: str(q && q.number), prompt: str(q && q.prompt), points: num(q && q.points), key: str(q && q.key), rubric: str(q && q.rubric), lines: isFinite(l) && l > 0 ? Math.min(28, l) : null };
+  });
+  return { title: str(o.title), mc: mc, sa: sa };
 }
 
 function parseJson_(t) { try { return JSON.parse(t); } catch (e) { return {}; } }
