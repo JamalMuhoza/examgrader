@@ -168,7 +168,11 @@ const Maker = (() => {
       const n = f.name.toLowerCase();
       if (onProgress) onProgress('Reading ' + f.name);
       if (/\.docx$/.test(n) || f.type === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
-        const r = await docxToText(await f.arrayBuffer()); out.kinds.push('docx'); out.figures += r.images; addText(r.text);
+        const buf = await f.arrayBuffer();
+        const r = await docxToText(buf); out.kinds.push('docx');
+        const tpl = files.length === 1 ? await parseTemplateDocx(buf) : null;
+        if (tpl) { out.template = tpl; out.figures += tpl.figures; } else out.figures += r.images;
+        addText(r.text);
       } else if (/\.pdf$/.test(n) || f.type === 'application/pdf') {
         const r = await pdfExtract(await f.arrayBuffer(), (p, t) => onProgress && onProgress(`Reading ${f.name}: page ${p} of ${t}`));
         out.kinds.push('pdf'); out.figures += r.images;
@@ -504,6 +508,214 @@ const Maker = (() => {
     return finalize(res);
   }
 
+  // ---------------- Word template (content controls) ----------------
+  // templates/exam-template-base.docx (built by tools/make_template.py) looks like the printed exam. Every editable part
+  // is a content control with a stable tag; question blocks are block-level controls tagged "mcq" / "saq".
+  const TPL_BASE = 'templates/exam-template-base.docx';
+  const OURS = /^(Bubble [A-E0-9]|Write box|Name box|Score box|Points box|Filled|Check|Cross|Corner square \d|Page code)$/;
+  const HINTS = [/^Type (?:written )?question \d+ here$/i, /^Choice [A-E]$/, /^Choose correct answer$/i, /^Type the model answer used for grading$/i,
+    /^Points per element, for example:/i, /^(?:School name|Course|Teacher|Exam title|Date)$/];
+  const sdtTag = s => wval(kid(kid(s, 'sdtPr'), 'tag')) || '';
+  const normWS = s => String(s || '').replace(/\s+/g, ' ').trim();
+  // the template's own instruction text (same as the printed default): kept out of exam.instructions unless the teacher edits it
+  const TPL_INSTR = normWS('Write your name in the box and your student ID in the grid, filling one bubble per digit. For multiple choice, completely fill the one bubble next to your answer with a dark pencil or pen. Erase changes cleanly. Write short answers inside the boxes. Work outside the boxes may not be graded. Keep all pages together and do not fold the pages.');
+  const MAX_DIGITS = 12, ID_COL = 7.2;
+  const twip = v => Math.round(v * 1440 / 25.4);
+  function sdtText(s) {
+    const pr = kid(s, 'sdtPr');
+    if (kid(pr, 'showingPlcHdr')) return '';
+    const content = kid(s, 'sdtContent');
+    if (!content) return '';
+    let out = '';
+    const walk = (node, depth) => {
+      for (const c of Array.from(node.childNodes)) {
+        if (c.namespaceURI !== W) continue;
+        const n = c.localName;
+        if (n === 't') out += c.textContent;
+        else if (n === 'tab') out += ' ';
+        else if (n === 'br' || n === 'cr') out += '\n';
+        else if (n === 'del' || n === 'rPr' || n === 'pPr' || n === 'sdtPr' || n === 'instrText') continue;
+        else { walk(c, depth + 1); if (n === 'p') out += '\n'; }
+      }
+    };
+    walk(content, 0);
+    const v = out.replace(/ /g, ' ').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+    return HINTS.some(re => re.test(v)) ? '' : v;
+  }
+  function setSdtText(doc, s, value, asValue) {
+    const pr = kid(s, 'sdtPr'), content = kid(s, 'sdtContent');
+    const ph = kid(pr, 'showingPlcHdr');
+    const runs = Array.from(content.getElementsByTagNameNS(W, 'r'));
+    const r0 = runs[0];
+    runs.slice(1).forEach(r => r.parentNode.removeChild(r));
+    const ts = Array.from(r0.getElementsByTagNameNS(W, 't'));
+    ts.slice(1).forEach(t => t.parentNode.removeChild(t));
+    Array.from(r0.getElementsByTagNameNS(W, 'br')).forEach(t => t.parentNode.removeChild(t));
+    const t = ts[0];
+    t.textContent = value;
+    t.setAttributeNS('http://www.w3.org/XML/1998/namespace', 'xml:space', 'preserve');
+    if (asValue) {
+      if (ph) pr.removeChild(ph);
+      const old = kid(r0, 'rPr'); if (old) r0.removeChild(old);
+      const want = kid(pr, 'rPr');
+      if (want) r0.insertBefore(want.cloneNode(true), r0.firstChild);
+    }
+  }
+
+  // Build the Word template for the counts the teacher picked. o = { mc, choices (4|5), sa, idDigits, school, course, teacher, title, date, version }
+  async function buildWordTemplate(o = {}) {
+    const nMC = Math.max(0, Math.min(100, o.mc | 0)), nSA = Math.max(0, Math.min(30, o.sa | 0));
+    if (nMC + nSA < 1) throw new Error('Choose at least one question');
+    const nCh = +o.choices === 4 ? 4 : 5;
+    const nd = Math.max(1, Math.min(MAX_DIGITS, o.idDigits | 0 || 7));
+    const res = await fetch(o.baseUrl || TPL_BASE);
+    if (!res.ok) throw new Error('Could not load the Word template (' + res.status + ')');
+    const zip = await JSZip.loadAsync(await res.arrayBuffer());
+    const doc = new DOMParser().parseFromString(await zip.file('word/document.xml').async('string'), 'application/xml');
+    const body = doc.getElementsByTagNameNS(W, 'body')[0];
+    const sdts = () => Array.from(doc.getElementsByTagNameNS(W, 'sdt'));
+    const inner = (block, tag) => Array.from(block.getElementsByTagNameNS(W, 'sdt')).find(s => sdtTag(s) === tag);
+    const parentP = n => { while (n && !(n.namespaceURI === W && n.localName === 'p')) n = n.parentNode; return n; };
+    const mcq = sdts().find(s => sdtTag(s) === 'mcq'), saq = sdts().find(s => sdtTag(s) === 'saq');
+    // section break paragraphs: [after cover, after the multiple-choice pages]
+    const breaks = kids(body, 'p').filter(p => kid(kid(p, 'pPr'), 'sectPr'));
+    const finalSect = kid(body, 'sectPr');
+    // multiple-choice blocks
+    for (let i = 1; i <= nMC; i++) {
+      const c = mcq.cloneNode(true);
+      setSdtText(doc, inner(c, 'mc_stem'), `Type question ${i} here`, false);
+      if (nCh === 4) {
+        const e = inner(c, 'mc_E'); const p = parentP(e); p.parentNode.removeChild(p);
+        const dd = inner(c, 'mc_key');
+        Array.from(dd.getElementsByTagNameNS(W, 'listItem')).filter(li => li.getAttributeNS(W, 'value') === 'E').forEach(li => li.parentNode.removeChild(li));
+      }
+      mcq.parentNode.insertBefore(c, mcq);
+    }
+    for (let i = 1; i <= nSA; i++) {
+      const c = saq.cloneNode(true);
+      setSdtText(doc, inner(c, 'sa_prompt'), `Type written question ${i} here`, false);
+      saq.parentNode.insertBefore(c, saq);
+    }
+    mcq.parentNode.removeChild(mcq); saq.parentNode.removeChild(saq);
+    // one question type only: drop the page break between the two sections (the last section keeps the question-page header)
+    if (!nMC || !nSA) {
+      const b = breaks[1], sp = kid(kid(b, 'pPr'), 'sectPr');
+      kids(sp, 'headerReference').concat(kids(sp, 'footerReference')).reverse().forEach(r => finalSect.insertBefore(r.cloneNode(true), finalSect.firstChild));
+      b.parentNode.removeChild(b);
+    }
+    // header fields from Settings
+    const fields = { hdr_school: o.school, hdr_course: o.course, hdr_teacher: o.teacher, hdr_title: o.title, hdr_date: o.date, hdr_version: o.version };
+    sdts().forEach(s => { const v = fields[sdtTag(s)]; if (v !== undefined && v !== null && String(v).trim()) setSdtText(doc, s, String(v).trim(), true); });
+    // Student ID grid: keep nd columns
+    const tbls = Array.from(doc.getElementsByTagNameNS(W, 'tbl'));
+    const cap = t => wval(kid(kid(t, 'tblPr'), 'tblCaption'));
+    const grid = tbls.find(t => cap(t) === 'idgrid'), row = tbls.find(t => cap(t) === 'idrow');
+    const gw = nd * ID_COL + 8;
+    Array.from(grid.getElementsByTagNameNS(W, 'p')).forEach(p => {
+      const tabs = kid(kid(p, 'pPr'), 'tabs');
+      if (!tabs) return;
+      kids(tabs, 'tab').slice(nd).forEach(t => tabs.removeChild(t));
+      kids(p, 'r').slice(2 * nd).forEach(r => p.removeChild(r));
+    });
+    const setW = (node, mmv) => node.setAttributeNS(W, 'w:w', String(twip(mmv)));
+    setW(kid(kid(grid, 'tblPr'), 'tblW'), gw);
+    setW(kids(kid(grid, 'tblGrid'), 'gridCol')[0], gw);
+    setW(kid(kid(grid.getElementsByTagNameNS(W, 'tc')[0], 'tcPr'), 'tcW'), gw);
+    const widths = [gw, 8, 172 - gw - 8];
+    kids(kid(row, 'tblGrid'), 'gridCol').forEach((g, i) => setW(g, widths[i]));
+    kids(kids(row, 'tr')[0], 'tc').forEach((tc, i) => setW(kid(kid(tc, 'tcPr'), 'tcW'), widths[i]));
+    // unique ids for content controls and pictures
+    let sid = 1;
+    sdts().forEach(s => { const id = kid(kid(s, 'sdtPr'), 'id'); if (id) id.setAttributeNS(W, 'w:val', String(sid++)); });
+    let pid = 5000;
+    const WP = 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing', PIC = 'http://schemas.openxmlformats.org/drawingml/2006/picture';
+    Array.from(doc.getElementsByTagNameNS(WP, 'docPr')).forEach(d => {
+      pid++; d.setAttribute('id', String(pid));
+      const g = d.parentNode.getElementsByTagNameNS(PIC, 'cNvPr')[0]; if (g) g.setAttribute('id', String(pid));
+    });
+    let xml = new XMLSerializer().serializeToString(doc);
+    if (!/^<\?xml/.test(xml)) xml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + xml;
+    const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const tot = { NMC: nMC, MCPTS: nMC, NSA: nSA, SAPTS: nSA * 5, TOTAL: nMC + nSA * 5 };
+    xml = xml.replace(/\{(NMC|MCPTS|NSA|SAPTS|TOTAL)\}/g, (m, k) => String(tot[k]));
+    zip.file('word/document.xml', xml);
+    const hdrLine = esc([o.title || 'Exam title', o.course].filter(x => x && String(x).trim()).join('  |  '));
+    for (const n of Object.keys(zip.files).filter(n => /^word\/header\d+\.xml$/.test(n))) {
+      const s = await zip.file(n).async('string');
+      if (s.includes('{HDRLINE}')) zip.file(n, s.replace('{HDRLINE}', hdrLine));
+    }
+    return zip.generateAsync({ type: 'blob', compression: 'DEFLATE', mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' });
+  }
+
+  // Read a filled Word template deterministically (no AI). Returns null when the file is not the Exam Grader template.
+  async function parseTemplateDocx(buf) {
+    const zip = buf instanceof JSZip ? buf : await JSZip.loadAsync(buf);
+    const f = zip.file('word/document.xml');
+    if (!f) return null;
+    const doc = new DOMParser().parseFromString(await f.async('string'), 'application/xml');
+    const tagged = Array.from(doc.getElementsByTagNameNS(W, 'sdt')).map(s => ({ s, tag: sdtTag(s).trim() })).filter(x => x.tag);
+    if (!tagged.some(x => x.tag === 'mc_stem' || x.tag === 'sa_prompt')) return null;
+    const res = { title: '', fields: {}, mc: [], sa: [], warnings: [], skipped: [], keyApplied: 0, source: 'template' };
+    const num = v => { const m = String(v).replace(',', '.').match(/-?\d+(?:\.\d+)?/); return m ? +m[0] : null; };
+    let cur = null;
+    for (const { s, tag } of tagged) {
+      if (tag === 'mcq' || tag === 'saq') continue;
+      const v = sdtText(s);
+      let m;
+      if ((m = tag.match(/^hdr_(\w+)$/))) { if (v && !(m[1] === 'instructions' && normWS(v) === TPL_INSTR)) res.fields[m[1]] = v; continue; }
+      if (tag === 'mc_stem') { cur = { type: 'mc', num: res.mc.length + 1, stem: v, raw: {}, keyLetter: '', points: null }; res.mc.push(cur); continue; }
+      if (tag === 'sa_prompt') { cur = { type: 'sa', num: res.sa.length + 1, prompt: v, points: null, key: '', rubric: '', lines: null }; res.sa.push(cur); continue; }
+      if (!cur) continue;
+      if ((m = tag.match(/^mc_([A-E])$/)) && cur.type === 'mc') { if (!(m[1] in cur.raw)) cur.raw[m[1]] = v; continue; }
+      if (tag === 'mc_key' && cur.type === 'mc') { cur.keyLetter = v; continue; }
+      if (tag === 'mc_points' && cur.type === 'mc') { cur.points = num(v); continue; }
+      if (cur.type !== 'sa') continue;
+      if (tag === 'sa_key') cur.key = v;
+      else if (tag === 'sa_rubric') cur.rubric = v;
+      else if (tag === 'sa_lines') cur.lines = num(v);
+      else if (tag === 'sa_points') cur.points = num(v);
+    }
+    const W_ = (msg, raw, level = 'warn') => res.warnings.push({ level, msg, raw });
+    // unused (empty) blocks are skipped; everything typed is kept
+    let emptyMC = 0, emptySA = 0;
+    res.mc = res.mc.filter(q => { const any = q.stem || Object.values(q.raw).some(Boolean); if (!any) emptyMC++; return any; });
+    res.sa = res.sa.filter(q => { const any = q.prompt || q.key || q.rubric; if (!any) emptySA++; return any; });
+    res.mc.forEach((q, i) => {
+      q.num = i + 1;
+      let last = -1;
+      LET.slice(0, 5).split('').forEach((L, k) => { if (q.raw[L]) last = k; });
+      q.choices = LET.slice(0, last + 1).split('').map(L => q.raw[L] || '');
+      const gaps = q.choices.map((c, k) => c ? null : LET[k]).filter(Boolean);
+      if (gaps.length) W_(`Question ${q.num}: choice ${gaps.join(', ')} is empty but a later choice is filled. Empty choices are printed as blank bubbles; fill or remove them in the editor.`, q.stem);
+      q.correct = null;
+      const k = String(q.keyLetter || '').trim().toUpperCase().match(/^\(?([A-E])\)?$/);
+      if (k) {
+        const idx = LET.indexOf(k[1]);
+        if (idx >= q.choices.length || !q.choices[idx]) W_(`Question ${q.num}: the correct answer is set to ${k[1]}, but choice ${k[1]} is empty.`, q.stem);
+        else q.correct = idx;
+      } else if (q.keyLetter) W_(`Question ${q.num}: the correct answer "${q.keyLetter}" is not a letter A to E.`, q.stem);
+      if (!(q.points > 0)) q.points = 1;
+      delete q.raw; delete q.keyLetter;
+    });
+    res.sa.forEach((q, i) => {
+      q.num = i + 1;
+      if (!(q.points > 0)) q.points = 5;
+      if (q.lines !== null) q.lines = Math.max(1, Math.min(28, Math.round(q.lines)));
+    });
+    if (emptyMC || emptySA) W_(`${[emptyMC ? emptyMC + ' empty multiple-choice block(s)' : '', emptySA ? emptySA + ' empty written block(s)' : ''].filter(Boolean).join(' and ')} in the template were left out.`, null, 'info');
+    res.title = res.fields.title || '';
+    // pictures the teacher pasted (not the template's own bubbles and boxes)
+    const WP = 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing';
+    // (Word may rename pasted pictures, so the template's own ones are also recognised by their exact size)
+    const SIZES = new Set([[5.2, 5.2], [6, 7], [112, 14], [50, 30], [14.5, 12]].map(([w, h]) => Math.round(w * 36000) + 'x' + Math.round(h * 36000)));
+    res.figures = Array.from(doc.getElementsByTagNameNS(WP, 'docPr')).filter(d => {
+      if (OURS.test(d.getAttribute('name') || '')) return false;
+      const ext = d.parentNode && Array.from(d.parentNode.childNodes).find(c => c.localName === 'extent');
+      return !(ext && SIZES.has(Math.round(+ext.getAttribute('cx')) + 'x' + Math.round(+ext.getAttribute('cy'))));
+    }).length;
+    return finalize(res);
+  }
+
   // ---------------- import result -> exam fields ----------------
   function toExam(exam, imp) {
     const f = imp.fields || {};
@@ -529,5 +741,5 @@ const Maker = (() => {
     return exam;
   }
 
-  return { BOLD, CHUNK, MAX_IMG, docxToText, pdfExtract, readFiles, parse, chunkText, requestsFor, aiRead, toExam, finalize, LET };
+  return { BOLD, CHUNK, MAX_IMG, docxToText, pdfExtract, readFiles, parse, chunkText, requestsFor, aiRead, toExam, finalize, LET, buildWordTemplate, parseTemplateDocx, TPL_BASE };
 })();
