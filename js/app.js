@@ -1532,6 +1532,22 @@
   const Q = { examId: null, jobs: [], total: 0, done: 0, running: false, pause: false, msg: '', blocked: '', finished: '' };
   function aiReady() { const st = S.settings; return !!(st.cloudUrl && st.cloudToken); }
   function aiOn() { return !!(S.settings.ai && S.settings.ai.enabled && aiReady()); }
+  // answer drawings imported from the teacher's key copy (no key scan uploaded): one grayscale JPEG for the AI
+  const KEYDRAW = new Map();
+  async function keyDrawing(q) {
+    const ims = (q.keyImgs || []).filter(im => im && im.src);
+    if (!ims.length) return null;
+    const ck = q.id + ':' + ims.map(im => im.src.length).join(',');
+    if (KEYDRAW.has(ck)) return KEYDRAW.get(ck);
+    const pics = await Promise.all(ims.map(im => U.loadImage(im.src)));
+    const W = Math.min(1100, Math.max(...pics.map(p => p.width))), sc = pics.map(p => Math.min(1, W / p.width));
+    const c = CV.canvasOf(W, Math.round(pics.reduce((a, p, i) => a + p.height * sc[i] + 8, 0)));
+    const ctx = c.getContext('2d'); ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
+    let y = 0; pics.forEach((p, i) => { ctx.drawImage(p, 0, y, p.width * sc[i], p.height * sc[i]); y += p.height * sc[i] + 8; });
+    const out = { b64: c.toDataURL('image/jpeg', 0.85).split(',')[1], w: c.width, h: c.height };
+    KEYDRAW.set(ck, out);
+    return out;
+  }
   function presetsOf(q) { return Array.from(new Set([...(q.comments || []), ...(S.exam.comments || [])])); }
   function saPage(stu, q) { const lq = L().sa.find(s => s.qid === q.id); return { lq, scan: lq ? gradeOf(stu).pages[lq.page] : null }; }
   function isTeacher(g) { return !!g && g.pts !== null && g.pts !== undefined && g.pts !== '' && (g.source === 'teacher' || (!g.source && g.ai !== 'accepted')); }
@@ -1638,7 +1654,7 @@
         setQ(`asking ${model}...`);
         const { lq, scan } = saPage(stu, q);
         const crop = AI.boxCrop(await imgOf(scan), lq);
-        const keyImg = S.exam.keyScan && S.exam.keyScan.sa && S.exam.keyScan.sa[q.id];
+        const keyImg = (S.exam.keyScan && S.exam.keyScan.sa && S.exam.keyScan.sa[q.id]) || await keyDrawing(q);
         await AI.bump();
         Q.inflight = true;
         let r;

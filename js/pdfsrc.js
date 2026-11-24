@@ -35,7 +35,7 @@ const PdfSrc = (() => {
       const w = rot ? h * it.str.length * 0.5 : Math.abs(it.width * vp.scale) || h * it.str.length * 0.5;
       // the same text drawn twice at the same place (hidden duplicate text layers): keep one
       if (seen.some(o => o.str === it.str && Math.abs(o.x - x) < 2 && Math.abs(o.y - y) < 2)) continue;
-      const o = { str: it.str, x, y, w, h, rot, page: no };
+      const o = { str: it.str, x, y, w, h, rot, page: no, font: it.fontName };
       seen.push(o);
       items.push(o);
     }
@@ -54,10 +54,26 @@ const PdfSrc = (() => {
         return false;
       };
       for (let i = items.length - 1; i >= 0; i--) if (!items[i].rot && !inked(items[i])) { items.splice(i, 1); hidden++; }
+      // ink colour of each text item (a key written in blue or red) and a coloured background behind it (highlighter)
+      items.forEach(o => {
+        if (o.rot) return;
+        const x0 = Math.max(0, Math.floor(o.x * 1.5)), x1 = Math.min(W - 1, Math.ceil((o.x + o.w) * 1.5));
+        const y0 = Math.max(0, Math.floor((o.y - o.h * 0.75) * 1.5)), y1 = Math.min(H - 1, Math.ceil((o.y + o.h * 0.15) * 1.5));
+        let n = 0, r = 0, gg = 0, b = 0, bgN = 0, bgC = 0, tot = 0;
+        for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+          const i = (y * W + x) * 4, R = d[i], G = d[i + 1], B = d[i + 2], sum = R + G + B; tot++;
+          if (sum < 3 * 170) { n++; r += R; gg += G; b += B; }
+          else if (sum < 3 * 248) { bgN++; if (Math.max(R, G, B) - Math.min(R, G, B) > 40) bgC++; }
+        }
+        if (n >= 3) { r /= n; gg /= n; b /= n; o.rgb = [Math.round(r), Math.round(gg), Math.round(b)]; o.colored = Math.max(r, gg, b) - Math.min(r, gg, b) > 60; }
+        o.hl = tot > 20 && bgC > 0.35 * tot;
+      });
+      // bold type (a key marked in bold): the font's own name, known once the page is rendered
+      items.forEach(o => { try { const f = o.font && page.commonObjs.has(o.font) ? page.commonObjs.get(o.font) : null; o.bold = !!(f && /bold|black|heavy|semibold|demi/i.test(f.name || '')); } catch (e) { o.bold = false; } });
       c.width = c.height = 1;
     } catch (e) { /* keep everything */ }
     // images: follow the transformation matrix through the operator list
-    const images = [];
+    const images = [], ellipses = [], rules = [];
     try {
       const ops = await page.getOperatorList(), O = pdfjsLib.OPS;
       let ctm = [1, 0, 0, 1, 0, 0]; const stack = [];
@@ -69,6 +85,28 @@ const PdfSrc = (() => {
         else if (f === O.transform) ctm = T(ctm, a);
         else if (f === O.paintFormXObjectBegin) { stack.push(ctm.slice()); if (a && a[0]) ctm = T(ctm, a[0]); }
         else if (f === O.paintFormXObjectEnd) ctm = stack.pop() || [1, 0, 0, 1, 0, 0];
+        else if (f === O.constructPath && a && a[0]) {
+          // small closed curves (a circled answer letter) and thin horizontal strokes (an underlined answer)
+          const ops = a[0], args = a[1] || [], P = [];
+          let k = 0, nC = 0, nM = 0, nL = 0, nR = 0;
+          for (const o of ops) {
+            if (o === O.moveTo) { nM++; P.push([args[k], args[k + 1]]); k += 2; }
+            else if (o === O.lineTo) { nL++; P.push([args[k], args[k + 1]]); k += 2; }
+            else if (o === O.curveTo) { nC++; P.push([args[k], args[k + 1]], [args[k + 2], args[k + 3]], [args[k + 4], args[k + 5]]); k += 6; }
+            else if (o === O.curveTo2 || o === O.curveTo3) { nC++; P.push([args[k], args[k + 1]], [args[k + 2], args[k + 3]]); k += 4; }
+            else if (o === O.rectangle) { nR++; const [x, y, w, h] = args.slice(k, k + 4); P.push([x, y], [x + w, y + h]); k += 4; }
+          }
+          if (P.length) {
+            const m = T(vp.transform, ctm);
+            const tp = P.map(([u, v]) => [m[0] * u + m[2] * v + m[4], m[1] * u + m[3] * v + m[5]]);
+            const xs = tp.map(q => q[0]), ys = tp.map(q => q[1]);
+            const b = { x0: Math.min(...xs), y0: Math.min(...ys), x1: Math.max(...xs), y1: Math.max(...ys), page: no };
+            const bw = b.x1 - b.x0, bh = b.y1 - b.y0;
+            // control points of a circle drawn with Bezier curves lie on its bounding box
+            if (nC >= 2 && nM === 1 && nL <= 1 && !nR && bw >= 5 && bh >= 5 && bw <= 60 && bh <= 30 && bw / bh > 0.4 && bw / bh < 3) ellipses.push(b);
+            else if (!nC && (nL || nR) && bh <= 1.6 && bw >= 6) rules.push(b);
+          }
+        }
         else if (IMG.has(f)) {
           const m = T(vp.transform, ctm);
           const pts = [[0, 0], [1, 0], [0, 1], [1, 1]].map(([u, v]) => [m[0] * u + m[2] * v + m[4], m[1] * u + m[3] * v + m[5]]);
@@ -132,7 +170,7 @@ const PdfSrc = (() => {
     for (let i = items.length - 1; i >= 0; i--) if (!items[i].rot && !inLines.has(items[i])) { items.splice(i, 1); hidden++; }
     const rotChars = items.filter(i => i.rot).reduce((a, i) => a + i.str.replace(/\s/g, '').length, 0);
     const chars = items.reduce((a, i) => a + i.str.replace(/\s/g, '').length, 0);
-    return { no, w: vp.width, h: vp.height, items, images, lines, floats, chars, rotChars, hidden };
+    return { no, w: vp.width, h: vp.height, items, images, lines, floats, chars, rotChars, hidden, ellipses, rules };
   }
 
   // text of a run of items with spaces from gaps and super/subscripts from size and baseline
@@ -429,6 +467,21 @@ const PdfSrc = (() => {
     for (let p = 1; p <= pdf.numPages; p++) { say(`Reading page ${p} of ${pdf.numPages}`); pages.push(await readPage(await pdf.getPage(p), p)); }
     markFurniture(pages);
     const { questions, sections } = analyzeStructure(pages, opts);
+    // the key colour: the most used non-black text colour (a key typed in blue or red); null when the text is all black
+    const keyRGB = (() => {
+      const bins = new Map();
+      pages.forEach(p => p.items.forEach(it => { if (!it.colored) return; const k = it.rgb.map(v => v >> 5).join(','); const b = bins.get(k) || { n: 0, rgb: [0, 0, 0] }; const n = it.str.replace(/\s/g, '').length; b.n += n; b.rgb = b.rgb.map((v, i) => v + it.rgb[i] * n); bins.set(k, b); }));
+      let best = null; bins.forEach(b => { if (!best || b.n > best.n) best = b; });
+      return best && best.n >= 8 ? best.rgb.map(v => v / best.n) : null;
+    })();
+    const nearKey = rgb => !!(keyRGB && rgb && Math.hypot(rgb[0] - keyRGB[0], rgb[1] - keyRGB[1], rgb[2] - keyRGB[2]) < 90 && Math.max(...rgb) - Math.min(...rgb) > 50);
+    const keyItem = it => !!(it && it.colored && nearKey(it.rgb));
+    // average ink colour of a cut-out (drawings in the key colour are part of the answer key)
+    const inkRGB = cnv => {
+      const d = cnv.getContext('2d').getImageData(0, 0, cnv.width, cnv.height).data; let n = 0, r = 0, g = 0, b = 0;
+      for (let i = 0; i < d.length; i += 16) { if (Math.min(d[i], d[i + 1], d[i + 2]) < 200) { n++; r += d[i]; g += d[i + 1]; b += d[i + 2]; } }
+      return n ? [r / n, g / n, b / n] : null;
+    };
     const warnings = [];
     // ---- per question: labels, owners, regions ----
     const Q = questions.map(q => {
@@ -507,7 +560,7 @@ const PdfSrc = (() => {
         const top = Math.min(...ls.map(l => l.top)) - 4;
         const nxt = Q[Q.indexOf(R) + 1];
         const nl = nxt ? nxt.q.lines.filter(l => l.page === p.no) : [];
-        const end = nl.length ? Math.min(...nl.map(l => l.top)) : Math.max(...ls.map(l => l.bottom)) + 30;
+        const end = nl.length ? Math.min(...nl.map(l => l.top)) : p.h;   // the last question on a page owns the pictures below it
         if (cy >= top && cy < end) host = R;
       });
       if (!host) return;
@@ -640,12 +693,31 @@ const PdfSrc = (() => {
           groups.forEach(gr => {
             const crop = finishCrop(gr.map(f => f.part));
             const f = gr[0], b = union(...gr.map(x => x.box));
+            // a drawing or typed structure in the key colour is part of the answer key, never part of the question
+            crop.key = !!keyRGB && gr.every(x => !x.raster && (x.glyph ? x.absorb.filter(pc => keyItem(pc.it)).length >= 0.6 * Math.max(1, x.absorb.length) : nearKey(inkRGB(x.part.canvas))));
+            crop.parts = gr.map(x => x.part);
             crop.kind = f.raster ? 'picture' : f.glyph ? 'glyphs' : 'drawing';
             crop.page = p.no; crop.box = { x0: Math.round(b.x0), y0: Math.round(b.y0), x1: Math.round(b.x1), y1: Math.round(b.y1) };
             if (!figOut.has(reg)) figOut.set(reg, []);
             figOut.get(reg).push(crop);
           });
         });
+        // answer drawings in the key colour (a structure the student must draw): one key picture with the key-coloured
+        // labels around them (CH2OH, OH, ...); those labels then stay out of the typed key text
+        const keyDraw = [...figs.values()].flat().filter(f => f.part && !f.raster && keyRGB && (f.glyph ? f.absorb.filter(pc => keyItem(pc.it)).length >= 0.6 * Math.max(1, f.absorb.length) : nearKey(inkRGB(f.part.canvas))));
+        // typed key layouts (a reaction set out in columns) count as drawings too; key prose stays typed text
+        const kp = R.pieces.filter(pc => pc.line.page === p.no && keyItem(pc.it) && !blank(pc.s));
+        const prose = pc => (pc.line.text.match(/[a-z]{4,}/g) || []).length >= 3 && !/\s{3}/.test(pc.line.text);
+        const spread = kp.filter(pc => { const ks = pc.line.items.filter(keyItem).sort((x, y) => x.x - y.x); return ks.some((it, i) => i && it.x - (ks[i - 1].x + ks[i - 1].w) > 24) || /\S\s{6,}\S/.test(pc.it.str); });
+        if (keyDraw.length || spread.length) {
+          let U = union(...keyDraw.map(f => f.box), ...spread.map(boxOf));
+          const inc = new Set([...keyDraw.flatMap(f => f.absorb), ...spread]);
+          for (let grow = true; grow;) { grow = false; kp.forEach(pc => { if (!inc.has(pc) && !prose(pc) && near(boxOf(pc), U, 14)) { inc.add(pc); U = union(U, boxOf(pc)); grow = true; } }); }
+          const own = [...inc].map(boxOf);
+          const others = all.filter(a => !a.img && !own.some(b => b.x0 === a.b.x0 && b.y0 === a.b.y0)).map(a => a.b);
+          const part = cutOut(cv, { x0: U.x0 - 2, y0: U.y0 - 2, x1: U.x1 + 2, y1: U.y1 + 2 }, own, others, {});
+          if (part) { (R.keyParts = R.keyParts || []).push(part); inc.forEach(pc => { pc.keyFig = true; }); }
+        }
       });
       // ---- non-question content on this page: listed under "Not used" by default (the teacher can opt in) ----
       const qLines = new Set(regs.flatMap(R => R.q.lines.filter(l => l.page === p.no)));
@@ -675,6 +747,7 @@ const PdfSrc = (() => {
         else {
           const sheet = looksLikeBubbleSheet(cv, g, GW, GH, opts.debug ? warnings : null, p.no);
           if (sheet) { why = 'looks like a separate bubble answer sheet; the printed exam has its own bubbles'; suggest = null; }
+          else if (textual < 40 && firstQPage !== null && p.no > Math.max(...Q.map(R => R.q.page))) { kind = 'reference'; why = 'a picture or chart after the questions (for example a table of structures): printed as a reference page, not graded. Choose "Not used" to leave it out.'; }
           else why = (textual < 40 ? 'a page without text (a picture or chart, for example a periodic table)' : 'a page without numbered questions') + ': not used by default. Choose "Reference page" to print it ungraded.';
           if (!sheet && tableShape(p.lines).cols >= 3) suggest = 'written';
         }
@@ -702,6 +775,83 @@ const PdfSrc = (() => {
     }
     pdf.destroy();
 
+    // ---- answer key marks and written questions ----
+    const charsOf = pcs => pcs.reduce((a, pc) => a + pc.s.replace(/\s/g, '').length, 0);
+    const ownPieces = (R, reg) => R.pieces.filter(pc => pc.owner === reg);
+    // a piece is answer-key text: in the key colour, and either most of its line is key text or it is written on a blank (____)
+    const lineKeyFrac = ln => { const all = ln.items.reduce((a, it) => a + it.str.replace(/\s/g, '').length, 0); const k = ln.items.filter(keyItem).reduce((a, it) => a + it.str.replace(/\s/g, '').length, 0); return all ? k / all : 0; };
+    const onBlank = pc => pc.line.items.some(it => { if (it === pc.it) return false; const m = it.str.match(/_{3,}/); if (!m) return false; const cpw = it.w / Math.max(1, it.str.length), bx0 = it.x + m.index * cpw, bx1 = bx0 + m[0].length * cpw; return Math.min(bx1, pc.x1) - Math.max(bx0, pc.x0) > 0.5 * Math.min(pc.x1 - pc.x0, bx1 - bx0); });
+    const isKeyPc = pc => keyItem(pc.it) && (lineKeyFrac(pc.line) >= 0.5 || onBlank(pc));
+    // the marked choice of a multiple-choice question: a circled letter (or circled choice), else one choice set apart by
+    // the key colour, bold type, a highlighter or an underline
+    function keyMark(R) {
+      const n = R.choices.length; if (n < 2) return null;
+      const circ = R.choices.map(c => {
+        const l = c.label, ln = R.q.lines[l.line], pg = pages[ln.page - 1];
+        const cx = (l.x + (l.piece ? l.piece.x1 : l.xe)) / 2, cy = ln.base - ln.size * 0.35;
+        return pg.ellipses.some(e => cx > e.x0 - 1.5 && cx < e.x1 + 1.5 && cy > e.y0 - 1.5 && cy < e.y1 + 1.5);
+      });
+      if (circ.filter(Boolean).length === 1) return { idx: circ.indexOf(true), by: 'circle' };
+      const feats = {
+        colour: pc => keyItem(pc.it) || !!pc.it.colored, bold: pc => !!pc.it.bold, highlight: pc => !!pc.it.hl,
+        underline: pc => pages[pc.line.page - 1].rules.some(r => r.y0 > pc.line.base - 1.5 && r.y0 < pc.line.base + 4 && Math.min(r.x1, pc.x1) - Math.max(r.x0, pc.x0) > 0.5 * (pc.x1 - pc.x0))
+      };
+      for (const [by, f] of Object.entries(feats)) {
+        const fr = R.choices.map(c => { const pcs = ownPieces(R, c).filter(pc => !blank(pc.s)); const all = charsOf(pcs); return all ? charsOf(pcs.filter(f)) / all : 0; });
+        const on = fr.map(v => v >= 0.6), off = fr.filter(v => v <= 0.2).length;
+        if (on.filter(Boolean).length === 1 && off === n - 1) return { idx: on.indexOf(true), by };
+      }
+      return null;
+    }
+    // a numbered question without choices, or whose a./b./c. parts hold the answers (key-coloured answer lines, or large
+    // answer spaces between the parts) is a written question
+    function isWritten(R) {
+      if (!R.choices.length) return true;
+      const keyLines = R.choices.map(c => { const pcs = ownPieces(R, c).filter(pc => !blank(pc.s)); const all = charsOf(pcs), k = charsOf(pcs.filter(isKeyPc)); return { all, k, sepLine: pcs.some(pc => isKeyPc(pc) && pc.line !== R.q.lines[c.label.line]) }; });
+      if (keyLines.some(x => x.sepLine && x.k >= 8)) return true;
+      if (keyMark(R)) return false;
+      if (keyLines.filter(x => x.all && x.k / x.all >= 0.6).length >= 2) return true;
+      if (R.choices.some(c => c.imgs.length || (figOut.get(c) || []).length)) return false;
+      const ls = R.choices.map(c => R.q.lines[c.label.line]);
+      return ls.length >= 2 && ls.every((ln, i) => !i || (ln.page === ls[i - 1].page && ln.base - ls[i - 1].base > 4 * ln.size));
+    }
+    // prompt (what the student sees) and key (model answer) of a written question; key-coloured drawings go to the key picture
+    function writtenOf(R, textOf) {
+      const LIST = /^(_{2,}|•|·|▪|[-–]\s|\(?[a-zA-Z0-9]{1,2}[.)]\s)/;
+      const linesOf = (reg, keep) => {
+        const byLine = new Map();
+        R.pieces.filter(pc => pc.owner === reg && !pc.figure && keep(pc)).forEach(pc => { if (!byLine.has(pc.line)) byLine.set(pc.line, []); byLine.get(pc.line).push(pc); });
+        return [...byLine.entries()].map(([ln, pcs]) => ({ ln, t: lineText(pcs.map(pc => ({ ...pc.it, str: pc.it.str.slice(pc.a, pc.b), x: pc.x0, w: pc.x1 - pc.x0 })), ln) })).filter(x => x.t);
+      };
+      const join = ls => ls.reduce((s, x) => !s ? x.t : (LIST.test(x.t) ? s + '\n' + x.t : /[A-Za-z]-$/.test(s) ? s + x.t : s + ' ' + x.t), '');
+      const bare = t => t.replace(/_{2,}/g, ' ').replace(/^\s*\(?[a-zA-Z0-9]{1,2}[.)]\s*/, '').replace(/\s+/g, ' ').trim();
+      const keyLines = (reg, head) => {
+        const ks = linesOf(reg, pc => isKeyPc(pc) && !pc.keyFig), out = [];
+        ks.forEach((x, i) => {
+          const rest = bare(linesOf(reg, pc => !isKeyPc(pc)).filter(y => y.ln === x.ln).map(y => y.t).join(' '));
+          const t = x.t.replace(/^[_^]\{([^{}]*)\}$/, '$1');   // a letter written on a blank sits lower or higher than the line
+          if (rest) out.push({ t: rest + ': ' + t, nl: true });
+          else if (i === 0 && head) out.push({ t: head + (/[.)]$/.test(head) ? ' ' : ': ') + t, nl: true });
+          else out.push({ t });
+        });
+        return out.reduce((s, x) => !s ? x.t : (x.nl || LIST.test(x.t) ? s + '\n' + x.t : /[A-Za-z]-$/.test(s) ? s + x.t : s + ' ' + x.t), '');
+      };
+      let prompt = join(linesOf(R.stem, pc => !isKeyPc(pc)));
+      const key = [keyLines(R.stem, '')];
+      R.choices.forEach(c => {
+        const lbl = (c.label.piece ? c.label.piece.s : c.label.letter + '.').trim();
+        const title = join(linesOf(c, pc => !isKeyPc(pc)));
+        prompt += '\n' + (lbl + ' ' + title).trim();
+        key.push(keyLines(c, (lbl + ' ' + bare(title)).trim()));
+      });
+      const figsOf = regs => regs.flatMap(r => figOut.get(r) || []);
+      const allFigs = figsOf([R.stem, ...R.choices]);
+      const keyFigs = allFigs.filter(f => f.key), promptFigs = allFigs.filter(f => !f.key);
+      const kc = (R.keyParts || []).length ? finishCrop(R.keyParts) : null;
+      const keyFig = kc ? Object.assign(kc, { kind: 'key', page: R.q.page }) : null;
+      return { prompt: prompt.trim(), key: key.filter(Boolean).join('\n').trim(), promptFigs, keyFig };
+    }
+
     // ---- questions out ----
     const mc = Q.map(R => {
       const fin = reg => { const parts = crops.get(reg) || []; const rb = regionBase.get(reg) || {}; return finishCrop(parts, rb.base, rb.center); };
@@ -715,18 +865,24 @@ const PdfSrc = (() => {
         });
         return out.reduce((s, t) => !s ? t : /[A-Za-z]-$/.test(s) ? s + t : s + ' ' + t, '').replace(/\s+/g, ' ').trim();
       };
-      const stemFigs = figOut.get(R.stem) || [];
-      const chFigs = R.choices.map(c => (figOut.get(c) || [])[0] || null);
-      return {
-        num: R.num, page: R.q.page, odd: R.q.odd, stem: textOf(R.stem), choices: R.choices.map(textOf), stemFigs, choiceFigs: chFigs,
-        markedChoice: R.choices.findIndex(c => c.marked)
-      };
+      const stemFigs = (figOut.get(R.stem) || []).filter(f => !f.key);
+      const chFigs = R.choices.map(c => (figOut.get(c) || []).filter(f => !f.key)[0] || null);
+      const out = { num: R.num, page: R.q.page, odd: R.q.odd, stem: textOf(R.stem), choices: R.choices.map(textOf), stemFigs, choiceFigs: chFigs, markedChoice: R.choices.findIndex(c => c.marked) };
+      if (isWritten(R)) Object.assign(out, writtenOf(R, textOf), { written: true, choices: [], choiceFigs: [] });
+      else {
+        const mk = keyMark(R);
+        if (out.markedChoice < 0 && mk) { out.markedChoice = mk.idx; out.markedBy = mk.by; }
+      }
+      [...stemFigs, ...chFigs, ...(out.keyFigs || []), ...(out.promptFigs || [])].forEach(f => { if (f) delete f.parts; });
+      return out;
     });
+    mc.filter(q => q.written).forEach(q => { if (q.keyFig) delete q.keyFig.parts; });
     const hid = pages.reduce((a, p) => a + p.hidden, 0);
     if (hid) warnings.push({ level: 'info', msg: `${hid} piece(s) of hidden text (white, invisible or covered, not on the paper) were ignored.` });
     // never fail silently: choices that look unsplit, missing choices, text that could not be placed
     const LBL = /(?:^|\s)\(?([A-Ha-h])\s*[.)]\s/;
     mc.forEach(q => {
+      if (q.written) return;
       if (!q.choices.length) warnings.push({ level: 'warn', msg: `Question ${q.num}: no answer choices were found (labels like A. or a) at the start of a line). Check it on the page images.`, raw: q.stem });
       else if (q.choices.length === 1) warnings.push({ level: 'warn', msg: `Question ${q.num}: only choice A was found. Check whether its other choices were missed.`, raw: q.choices[0] });
       q.choices.forEach((c, k) => { const m = c.match(LBL); if (m && 'ABCDEFGH'.indexOf(m[1].toUpperCase()) > k) warnings.push({ level: 'warn', msg: `Question ${q.num}, choice ${'ABCDEFGH'[k]} contains "${m[1]}${c.slice(m.index).trim()[1] || '.'}": its choices may not be split correctly. Check this question.`, raw: c }); });

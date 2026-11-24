@@ -517,6 +517,7 @@ const Layout = (() => {
 
   function buildPDF(exam, L, opts = {}) {
     const { jsPDF } = window.jspdf;
+    const PT = 25.4 / 72;
     const key = !!opts.key;
     const doc = new jsPDF({ unit: 'mm', format: 'letter', compress: true });
     doc.setProperties({ title: (exam.title || 'Exam') + (key ? ' - Answer Key' : ''), creator: 'Exam Grader' });
@@ -574,11 +575,24 @@ const Layout = (() => {
         doc.text('pts', sb.x + 1.2, sb.y + 2.6);
         doc.setFontSize(7.5);
         doc.text('max ' + U.fmt(s.max), sb.x + sb.w / 2, sb.y + sb.h + 3.2, { align: 'center' });
+        let ky = s.box.y + 5;
         if (key && q.key) {
           doc.setTextColor(0, 85, 58); doc.setFontSize(9.5);
           const ku = needsUni(q.key);
-          const kl = wrap(doc, 'Key: ' + q.key, s.box.w - 6, 9.5, 'normal', ku);
-          textLines(doc, kl, s.box.x + 3, s.box.y + 5, 9.5, 'normal', lh(9.5), 60, ku);
+          let kl = wrap(doc, 'Key: ' + q.key, s.box.w - 6, 9.5, 'normal', ku);
+          const room = Math.max(1, Math.floor((s.box.h - 4) / lh(9.5)));
+          if (kl.length > room) kl = kl.slice(0, room);
+          textLines(doc, kl, s.box.x + 3, ky, 9.5, 'normal', lh(9.5), 60, ku);
+          ky += kl.length * lh(9.5);
+        }
+        // answer drawings from the teacher's key copy (answer key PDF only), fitted into the rest of the box
+        if (key && (q.keyImgs || []).length) {
+          let iy = ky - 2;
+          q.keyImgs.forEach((im, k) => {
+            const maxH = s.box.y + s.box.h - 1.5 - iy; if (maxH < 8) return;
+            const sc = Math.min(1, (s.box.w - 6) / (im.wpt * PT), maxH / (im.hpt * PT)), w = im.wpt * PT * sc, h = im.hpt * PT * sc;
+            pic(im, { x: s.box.x + 3, y: iy, w, h }, s.qid + ':k' + k); iy += h + 1;
+          });
         }
       });
     }
@@ -593,8 +607,14 @@ const Layout = (() => {
     doc.setTextColor(30); doc.setFont('helvetica', 'normal'); doc.setFontSize(11.5);
     const sub = [exam.course, exam.teacher].filter(Boolean).join('   |   ');
     doc.text(U.pdfText(sub), PAGE.w / 2, 38.5, { align: 'center', maxWidth: 170 });
-    doc.setFont('helvetica', 'bold'); doc.setFontSize(19); doc.setTextColor(15);
-    doc.text(U.pdfText(exam.title || 'Exam') + (key ? '  (ANSWER KEY)' : ''), PAGE.w / 2, 50, { align: 'center', maxWidth: 175 });
+    doc.setFont('helvetica', 'bold'); doc.setTextColor(15);
+    // a long title: smaller type on up to two lines, kept clear of the date line below it
+    const title = U.pdfText(exam.title || 'Exam') + (key ? '  (ANSWER KEY)' : '');
+    let tsz = 19, tl;
+    for (; tsz >= 12; tsz -= 1) { doc.setFontSize(tsz); tl = doc.splitTextToSize(title, 175); if (tl.length === 1 || (tl.length === 2 && tsz <= 16)) break; }
+    doc.setFontSize(tsz); tl = tl.slice(0, 2);
+    const tlh = tsz * PTMM * 1.15;
+    tl.forEach((ln, i) => doc.text(ln, PAGE.w / 2, (tl.length === 1 ? 50 : 46.2) + i * tlh, { align: 'center' }));
     doc.setFont('helvetica', 'normal'); doc.setFontSize(10.5); doc.setTextColor(60);
     const meta = [exam.date ? 'Date: ' + exam.date : '', exam.version ? 'Version ' + exam.version : '', `${L.pageCount} pages`].filter(Boolean).join('     ');
     doc.text(U.pdfText(meta), PAGE.w / 2, 58, { align: 'center' });

@@ -577,7 +577,12 @@ const Maker = (() => {
       const t = s.raw;
       if (s.why !== 'before the first question') break;
       if (t.length < 4 || t.length > 80 || /_{3,}|^name\b|^id\b|^date\b|^how to use|^multiple choice:|^written answers:|^instead of|^figures/i.test(t)) continue;
-      if (/\b(exam|test|quiz|midterm|final|assessment)\b/i.test(t)) return t;
+      if (/\b(exam|test|quiz|midterm|final|assessment)\b/i.test(t)) {
+        // a title set as a stack of one- or two-word lines on the cover ("Introduction / to / Organic / ... / Exam III")
+        const i = skipped.indexOf(s), stack = [];
+        for (let j = i - 1; j >= 0 && skipped[j].why === 'before the first question' && /^[A-Za-z&]+(?:\s[A-Za-z&]+)?$/.test(skipped[j].raw.trim()); j--) stack.unshift(skipped[j].raw.trim());
+        return stack.length >= 2 && (stack.join(' ') + ' ' + t).length <= 100 ? stack.join(' ') + ' ' + t : t;
+      }
     }
     return '';
   }
@@ -701,14 +706,27 @@ const Maker = (() => {
       if (!r || !r.ok) throw new Error((r && r.error) || 'AI reading failed');
       const x = r.result || {};
       if (!res.title && x.title) res.title = x.title;
+      // the model sometimes copies the printed number into the text ("21. Draw ..."); the app prints its own number
+      const unNum = (t, n) => String(t || '').replace(new RegExp('^\\s*(?:Q(?:uestion)?\\s*)?\\(?' + (String(n || '').replace(/\D/g, '') || '\\d{1,3}') + '\\s*[.):]\\s+'), '');
       (x.mc || []).forEach(q => {
-        const o = { type: 'mc', num: src.pdfLook && +q.number ? +q.number : res.mc.length + 1, docNum: q.number || '', stem: q.stem || '', choices: (q.choices || []).map(String), correct: (q.correct === null || q.correct === undefined) ? null : q.correct, points: q.points || null, part: i + 1, ai: true };
+        const o = { type: 'mc', num: src.pdfLook && +q.number ? +q.number : res.mc.length + 1, docNum: q.number || '', stem: unNum(q.stem, q.number), choices: (q.choices || []).map(String), correct: (q.correct === null || q.correct === undefined) ? null : q.correct, points: q.points || null, part: i + 1, ai: true };
         const sf = (q.stemFigures || []).map(id => byId.get(id)).filter(Boolean);
         if (sf.length) o.imgs = sf;
         (q.choiceFigures || []).forEach(cf => { const f = byId.get(cf.figure); if (f && cf.choice < o.choices.length) { o.choiceImgs = o.choiceImgs || []; o.choiceImgs[cf.choice] = f; } });
         res.mc.push(o);
       });
-      (x.sa || []).forEach(q => res.sa.push({ type: 'sa', num: res.sa.length + 1, docNum: q.number || '', prompt: q.prompt || '', points: q.points || null, key: q.key || '', rubric: q.rubric || '', lines: q.lines || null, part: i + 1, ai: true }));
+      (x.sa || []).forEach(q => res.sa.push({ type: 'sa', num: res.sa.length + 1, docNum: q.number || '', prompt: unNum(q.prompt, q.number), points: q.points || null, key: q.key || '', rubric: q.rubric || '', lines: q.lines || null, part: i + 1, ai: true }));
+    }
+    // what the layout reader found in a typed PDF (circled answers, key-coloured model answers, answer drawings) fills gaps
+    if (layout) {
+      const lmc = new Map((layout.mc || []).map(q => [q.num, q])), lsa = new Map((layout.sa || []).map(q => [q.num, q]));
+      res.mc.forEach(q => { const l = lmc.get(+q.docNum || q.num); if (l && q.correct === null && l.correct !== null && l.correct !== undefined && l.choices.length === q.choices.length) q.correct = l.correct; });
+      res.sa.forEach(q => {
+        const l = lsa.get(+q.docNum); if (!l) return;
+        if (!(q.imgs || []).length && (l.imgs || []).length) q.imgs = l.imgs;
+        if ((l.keyImgs || []).length) q.keyImgs = l.keyImgs;
+        if (!q.key && l.key) q.key = l.key;
+      });
     }
     // an answer key listed at the end of a long document reaches the AI separately from its questions: apply it here
     const det = parse(src.text);
@@ -996,6 +1014,7 @@ const Maker = (() => {
     det.mc.forEach(q => { if (!byNum.has(q.num)) byNum.set(q.num, []); byNum.get(q.num).push(q); });
     const saByNum = new Map(det.sa.filter(q => q.fromMC).map(q => [q.num, q]));
     (ps.warnings || []).forEach(w => typeof w === 'string' ? W_(w, null, 'info') : W_(w.msg, w.raw || null, w.level || 'warn'));
+    const marked = {};
     ps.mc.forEach((p, i) => {
       const d = (byNum.get(p.num) || []).shift();
       if (p.odd === 'repeated') W_(`The document numbers two questions ${p.num} (the second one is on page ${p.page}). Both are kept and printed as ${p.num}, as in your document; in the gradebook and the scan review they are Q${i} and Q${i + 1} (questions are counted in order there).`, p.stem);
@@ -1004,10 +1023,17 @@ const Maker = (() => {
       let correct = d && d.choices.length === p.choices.length ? d.correct : null;
       const marks = p.choices.map(c => RE.mark.test(c));
       const choices = p.choices.map(c => clean(c.replace(RE.mark, '')));
-      if (p.markedChoice >= 0) correct = p.markedChoice;
+      if (p.markedChoice >= 0) { correct = p.markedChoice; if (p.markedBy) marked[p.markedBy] = (marked[p.markedBy] || 0) + 1; }
       else if (correct === null && marks.filter(Boolean).length === 1) correct = marks.indexOf(true);
       const points = tp.pts !== null ? tp.pts : d ? d.points : (saByNum.get(p.num) || {}).points || null;
       const imgs = (p.stemFigs || []).slice();
+      if (p.written) {
+        // written question: the prompt without the teacher's answers; key-coloured text and drawings are the model answer
+        const tw = takePoints(p.prompt || p.stem);
+        res.sa.push({ type: 'sa', num: p.num, prompt: tw.s, points: tw.pts !== null ? tw.pts : points, key: p.key || '', rubric: '', lines: null, fromMC: true, imgs: (p.promptFigs || []).slice(), keyImgs: p.keyFig ? [p.keyFig] : [] });
+        if (!p.key && !p.keyFig && choices.length) W_(`Question ${p.num} has parts (a, b, ...) with answer space, so it was added as a written question.`, tw.s, 'info');
+        return;
+      }
       if (!choices.length) {
         res.sa.push({ type: 'sa', num: p.num, prompt: tp.s, points, key: '', rubric: '', lines: null, fromMC: true, imgs });
         W_(`Question ${p.num} has no answer choices, so it was added as a written question.`, tp.s);
@@ -1019,10 +1045,13 @@ const Maker = (() => {
       q.choices.forEach((c, k) => { if (!c && !(q.choiceImgs && q.choiceImgs[k])) W_(`Question ${p.num}: choice ${LET[k]} is empty.`, p.stem); });
       res.mc.push(q);
     });
+    const HOW = { circle: 'a circled letter', colour: 'a choice in the key colour', bold: 'a bold choice', highlight: 'a highlighted choice', underline: 'an underlined choice' };
+    Object.entries(marked).forEach(([by, n]) => W_(`${n} correct answer(s) taken from ${HOW[by] || by} in your key. Check them.`, null, 'info'));
     // figure ids (for the AI reader and the review screen)
     let fid = 0;
     res.mc.forEach(q => { (q.imgs || []).forEach(f => { f.id = 'F' + (++fid); }); (q.choiceImgs || []).forEach(f => { if (f) f.id = 'F' + (++fid); }); });
     res.sa.forEach(q => (q.imgs || []).forEach(f => { f.id = 'F' + (++fid); }));
+    res.sa.forEach(q => (q.keyImgs || []).forEach(f => { f.id = 'K' + (++fid); }));
     const have = new Set(ps.mc.map(q => q.num));
     det.mc.filter(q => !have.has(q.num) && q.choices.length).forEach(q => { res.mc.push({ ...q, kind: 'mc' }); W_(`Question ${q.num} was found in the text but not on the page layout; it is printed as typed text.`, q.stem); });
     det.sa.filter(q => !(q.fromMC && have.has(q.num))).forEach(q => res.sa.push(q));
@@ -1063,6 +1092,7 @@ const Maker = (() => {
       const o = { id: U.uid('s_'), prompt: q.prompt || '', max: q.points || 5, lines: Math.max(1, Math.min(28, q.lines || 6)), comments: [], key: q.key || '', modelAnswer: q.key || '', rubric: q.rubric || '' };
       if (q.img) o.img = q.img;
       if (q.imgs) o.imgs = q.imgs;
+      if (q.keyImgs && q.keyImgs.length) o.keyImgs = q.keyImgs;   // answer drawings from the teacher's key copy: key PDF and AI grading only
       return o;
     };
     exam.sa = imp.sa.map(saOf);
