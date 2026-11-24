@@ -382,62 +382,68 @@ const Layout = (() => {
     if (sas.length && !compact) y = CONTENT.bottom + 1;
     else if (sas.length && mcs.length) y = mcEnd + 2;   // homework / quiz: written answers follow the questions on the same page
     const P_PT = 10.5, P_LH = lh(P_PT);
-    sas.forEach((q, qi) => {
-      if (q.kind === 'page' && q.img) {
-        // a written page from the teacher's document (for example a table to fill in): the page picture is the answer area
-        newPage('wpage');
-        const f = fitBox(q.img, CONTENT.right - CONTENT.left, 238 - CONTENT.top);
-        const box = { x: CONTENT.left + (CONTENT.right - CONTENT.left - f.w) / 2, y: CONTENT.top, w: f.w, h: f.h };
-        const bot = box.y + box.h;
-        L.sa.push({
-          qid: q.id, num: mcs.length + qi + 1, label: 'SA' + (qi + 1), page, max: +q.max || 0, top: CONTENT.top, kind: 'page',
-          prompt: { x: stemX, y: CONTENT.top, lines: [] }, box, img: box,
-          scoreBox: { x: 181.5, y: bot + 1.5, w: 14.5, h: 12 },
-          comment: { x: CONTENT.left, y: bot + 1.5, w: 150, h: 8 },
-          region: { x: 11.5, y: CONTENT.top - 1.5, w: 196 - 11.5 + 2, h: bot + 17 - CONTENT.top }
-        });
-        y = CONTENT.bottom + 1;
-        return;
-      }
+    // homework / quiz: two short written questions side by side (each box exactly its lines tall, never stretched)
+    const measureSA = (q, qi, wTxt) => {
       const uni = exam.uniText === true && !!UNI;
-      const lines = q.prompt && q.prompt.trim() && !q.img ? wrap(doc, q.prompt, CONTENT.right - stemX, P_PT, 'normal', uni) : (q.img ? [] : ['']);
-      const pImgs = [q.img, ...(q.imgs || [])].filter(Boolean).map(im => fitBox(im, CONTENT.right - stemX, 90));
+      const lines = q.prompt && q.prompt.trim() && !q.img ? wrap(doc, q.prompt, wTxt, P_PT, 'normal', uni) : (q.img ? [] : ['']);
+      const pImgs = [q.img, ...(q.imgs || [])].filter(Boolean).map(im => fitBox(im, wTxt, 90));
       const boxH = Math.max(1, q.lines || 6) * 8;
       const promptH = (lines.length ? lines.length * P_LH : 0) + pImgs.reduce((a, f) => a + f.h + 1.2, 0) + 2.0;
-      const h = promptH + boxH + 9 + 3;
-      if (h > CONTENT.bottom - CONTENT.top) L.issues.push(`Short answer ${qi + 1} box is taller than a page; reduce its lines.`);
-      if (y + h > CONTENT.bottom) newPage('sa');
-      const top = y;
-      const box = { x: stemX, y: top + promptH, w: 180 - stemX, h: boxH };
+      return { q, qi, uni, lines, pImgs, boxH, promptH, h: promptH + boxH + 9 + 3 };
+    };
+    const placeSA = (m, top, col, half) => {
+      const { q, qi, lines, pImgs, boxH, promptH, h } = m;
+      const ox = col * COLDX, sx = stemX + ox;
+      const box = { x: sx, y: top + promptH, w: half ? stemW - 16.5 : 180 - stemX, h: boxH };
       const item = {
-        qid: q.id, num: mcs.length + qi + 1, label: 'SA' + (qi + 1), page, max: +q.max || 0, top, uni,
-        prompt: { x: stemX, y: top, lines }, box,
-        scoreBox: { x: 182.5, y: box.y, w: 14.5, h: 12 },
-        comment: { x: stemX, y: box.y + boxH + 0.8, w: 196 - stemX, h: 8 },
-        region: { x: 11.5, y: top - 1.5, w: 196 - 11.5 + 2, h: h - 1.5 }
+        qid: q.id, num: mcs.length + qi + 1, label: 'SA' + (qi + 1), page, max: +q.max || 0, top, uni: m.uni,
+        prompt: { x: sx, y: top, lines }, box,
+        scoreBox: { x: half ? box.x + box.w + 2 : 182.5, y: box.y, w: 14.5, h: 12 },
+        comment: { x: sx, y: box.y + boxH + 0.8, w: half ? stemW : 196 - stemX, h: 8 },
+        region: half ? { x: col ? COL2_X0 : 11.5, y: top - 1.5, w: (col ? CONTENT.right + 2 : stemX + stemW) - (col ? COL2_X0 : 11.5), h: h - 1.5 } : { x: 11.5, y: top - 1.5, w: 196 - 11.5 + 2, h: h - 1.5 }
       };
-      if (pImgs.length) { let iy = top + lines.length * P_LH + 0.4; item.prompt.imgs = pImgs.map(f => { const r = { x: stemX, y: iy, w: f.w, h: f.h }; iy += f.h + 1.2; return r; }); }
+      if (half) { item.col = col; item.numX = 29.5 + ox; }
+      if (pImgs.length) { let iy = top + lines.length * P_LH + 0.4; item.prompt.imgs = pImgs.map(f => { const r = { x: sx, y: iy, w: f.w, h: f.h }; iy += f.h + 1.2; return r; }); }
       L.sa.push(item);
-      y = top + h;
-    });
-    // homework / quiz: the free space at the bottom of each written-answer page goes to its answer boxes
-    if (compact) {
-      const byPage = {};
-      L.sa.filter(s => s.kind !== 'page').forEach(s => (byPage[s.page] = byPage[s.page] || []).push(s));
-      Object.values(byPage).forEach(items => {
-        const free = CONTENT.bottom - Math.max(...items.map(s => s.region.y + s.region.h)) - 0.5;
-        if (free < 1) return;
-        const add = free / items.length;
-        let dy = 0;
-        items.forEach(s => {
-          s.top += dy; s.prompt.y += dy; (s.prompt.imgs || []).forEach(r => { r.y += dy; });
-          s.box.y += dy; s.box.h += add; s.scoreBox.y += dy; s.comment.y += dy + add;
-          s.region.y += dy; s.region.h += add;
-          dy += add;
-        });
-      });
-      frontPages();
+    };
+    const halfOK = (q, qi) => {
+      if (!compact || !q || q.kind === 'page' || q.img || (q.imgs || []).length || (q.lines || 6) > 8) return null;
+      const m = measureSA(q, qi, stemW);
+      return m.lines.length <= 5 ? m : null;   // a short prompt: five lines or fewer at half width
+    };
+    for (let qi = 0; qi < sas.length; qi++) {
+      const q = sas[qi];
+      if (q.kind === 'page' && q.img) {
+          // a written page from the teacher's document (for example a table to fill in): the page picture is the answer area
+          newPage('wpage');
+          const f = fitBox(q.img, CONTENT.right - CONTENT.left, 238 - CONTENT.top);
+          const box = { x: CONTENT.left + (CONTENT.right - CONTENT.left - f.w) / 2, y: CONTENT.top, w: f.w, h: f.h };
+          const bot = box.y + box.h;
+          L.sa.push({
+            qid: q.id, num: mcs.length + qi + 1, label: 'SA' + (qi + 1), page, max: +q.max || 0, top: CONTENT.top, kind: 'page',
+            prompt: { x: stemX, y: CONTENT.top, lines: [] }, box, img: box,
+            scoreBox: { x: 181.5, y: bot + 1.5, w: 14.5, h: 12 },
+            comment: { x: CONTENT.left, y: bot + 1.5, w: 150, h: 8 },
+            region: { x: 11.5, y: CONTENT.top - 1.5, w: 196 - 11.5 + 2, h: bot + 17 - CONTENT.top }
+          });
+          y = CONTENT.bottom + 1;
+          continue;
+      }
+      const a = halfOK(q, qi), b = a ? halfOK(sas[qi + 1], qi + 1) : null;
+      if (a && b) {
+        const h = Math.max(a.h, b.h);
+        if (y + h > CONTENT.bottom) newPage('sa');
+        placeSA(a, y, 0, true); placeSA(b, y, 1, true);
+        y += h; qi++;
+        continue;
+      }
+      const m = measureSA(q, qi, CONTENT.right - stemX);
+      if (m.h > CONTENT.bottom - CONTENT.top) L.issues.push(`Short answer ${qi + 1} box is taller than a page; reduce its lines.`);
+      if (y + m.h > CONTENT.bottom) newPage('sa');
+      placeSA(m, y, 0, false);
+      y += m.h;
     }
+    if (compact) frontPages();
     // ---- reference pages (printed, never graded) ----
     (exam.refPages || []).forEach(rp => {
       newPage('ref');
@@ -562,7 +568,7 @@ const Layout = (() => {
           return;
         }
         doc.setFont('helvetica', 'bold'); doc.setFontSize(10.5); doc.setTextColor(20);
-        doc.text(s.num + '.', 29.5, s.prompt.y + 3.7, { align: 'right' });
+        doc.text(s.num + '.', s.numX || 29.5, s.prompt.y + 3.7, { align: 'right' });
         textLines(doc, s.prompt.lines, s.prompt.x, s.prompt.y + 3.7, 10.5, 'normal', lh(10.5), 20, s.uni);
         (s.prompt.imgs || []).forEach((r, k) => pic([q.img, ...(q.imgs || [])].filter(Boolean)[k], r, s.qid + ':pi' + k));
         doc.setFont('helvetica', 'normal'); doc.setFontSize(8); doc.setTextColor(90);
