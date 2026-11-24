@@ -1,5 +1,5 @@
 /* Exam Grader service worker: offline cache for the app shell and the CDN libraries */
-const VERSION = 'examgrader-v14';
+const VERSION = 'examgrader-v15';
 const SHELL = [
   './', './index.html', './style.css', './manifest.webmanifest',
   './js/util.js', './js/db.js', './js/layout.js', './js/cv.js', './js/annot.js', './js/grade.js', './js/export.js', './js/ai.js', './js/pdfsrc.js', './js/maker.js', './js/app.js', './js/eglib.js', './templates/exam-template-base.docx',
