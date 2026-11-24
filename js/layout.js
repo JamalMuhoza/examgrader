@@ -382,7 +382,7 @@ const Layout = (() => {
     if (sas.length && !compact) y = CONTENT.bottom + 1;
     else if (sas.length && mcs.length) y = mcEnd + 2;   // homework / quiz: written answers follow the questions on the same page
     const P_PT = 10.5, P_LH = lh(P_PT);
-    // homework / quiz: two short written questions side by side (each box exactly its lines tall, never stretched)
+    // written questions: full width, one per row; each box exactly its lines tall (never stretched)
     const measureSA = (q, qi, wTxt) => {
       const uni = exam.uniText === true && !!UNI;
       const lines = q.prompt && q.prompt.trim() && !q.img ? wrap(doc, q.prompt, wTxt, P_PT, 'normal', uni) : (q.img ? [] : ['']);
@@ -406,11 +406,6 @@ const Layout = (() => {
       if (pImgs.length) { let iy = top + lines.length * P_LH + 0.4; item.prompt.imgs = pImgs.map(f => { const r = { x: sx, y: iy, w: f.w, h: f.h }; iy += f.h + 1.2; return r; }); }
       L.sa.push(item);
     };
-    const halfOK = (q, qi) => {
-      if (!compact || !q || q.kind === 'page' || q.img || (q.imgs || []).length || (q.lines || 6) > 8) return null;
-      const m = measureSA(q, qi, stemW);
-      return m.lines.length <= 5 ? m : null;   // a short prompt: five lines or fewer at half width
-    };
     for (let qi = 0; qi < sas.length; qi++) {
       const q = sas[qi];
       if (q.kind === 'page' && q.img) {
@@ -428,14 +423,6 @@ const Layout = (() => {
           });
           y = CONTENT.bottom + 1;
           continue;
-      }
-      const a = halfOK(q, qi), b = a ? halfOK(sas[qi + 1], qi + 1) : null;
-      if (a && b) {
-        const h = Math.max(a.h, b.h);
-        if (y + h > CONTENT.bottom) newPage('sa');
-        placeSA(a, y, 0, true); placeSA(b, y, 1, true);
-        y += h; qi++;
-        continue;
       }
       const m = measureSA(q, qi, CONTENT.right - stemX);
       if (m.h > CONTENT.bottom - CONTENT.top) L.issues.push(`Short answer ${qi + 1} box is taller than a page; reduce its lines.`);
