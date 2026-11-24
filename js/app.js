@@ -106,7 +106,7 @@
     const st = S.settings;
     return {
       id: uid('ex_'), created: Date.now(), updated: Date.now(),
-      school: st.school, course: st.course, teacher: st.teacher, title: 'New Exam', date: new Date().toISOString().slice(0, 10), version: 'A',
+      school: st.school, course: st.course, teacher: st.teacher, title: 'New Exam', date: new Date().toISOString().slice(0, 10), version: 'A', kind: 'exam',
       idDigits: st.idDigits || 7, instructions: '', mc: [], sa: [], roster: [], comments: [...(st.comments || [])], uniText: true
     };
   }
@@ -168,15 +168,25 @@
     return i;
   }
 
+  // assignment type: Exam (cover page) | Quiz | Homework (compact header on page 1)
+  const KIND_NAMES = { exam: 'Exam', quiz: 'Quiz', homework: 'Homework' };
+  function kindSelect(value, id, onChange) {
+    const sel = el('select', { id }, Layout.KINDS.map(k => el('option', { value: k, selected: k === value }, KIND_NAMES[k])));
+    sel.onchange = () => onChange(sel.value);
+    return sel;
+  }
+
   function viewSetup(v, embedded) {
     const e = S.exam;
     const changed = S.scans.length && e.printedSig && e.printedSig !== geomSig(e.layout);
-    if (!embedded) v.appendChild(el('div', { class: 'row between' }, el('h2', {}, 'Exam setup'), el('span', { id: 'saveState', class: 'muted small' }, 'Changes save automatically')));
+    if (!embedded) v.appendChild(el('div', { class: 'row between' }, el('h2', {}, 'Exam setup'),
+      el('div', { class: 'row' }, el('button', { class: 'btn small', id: 'btnClassSiteSetup', onclick: () => downloadClassSite() }, 'Download for class site'), el('span', { id: 'saveState', class: 'muted small' }, 'Changes save automatically'))));
     if (changed) v.appendChild(el('div', { class: 'card warn' }, 'The layout changed after this exam was printed and scanned. Bubbles may have moved. Reprint, or use "Re-read all scans" on the Scan screen only if the printed papers match the new layout.'));
     const meta = el('div', { class: 'card grid2' },
       field('School / institution', inp(e, 'school', { id: 'f_school' })),
       field('Course', inp(e, 'course', { id: 'f_course' })),
       field('Teacher', inp(e, 'teacher', { id: 'f_teacher' })),
+      field('Type', kindSelect(Layout.kindOf(e), 'f_kind', k => { e.kind = k; saveSoon(); const rb = $('#btnMakeRefresh'); if (rb) setTimeout(() => rb.click(), 450); }), 'Exam: full cover page. Quiz or Homework: title, name, score and student ID in a strip at the top of page 1'),
       field('Exam title', inp(e, 'title', { id: 'f_title' }, () => buildNavSoon())),
       field('Date', inp(e, 'date', { id: 'f_date', type: 'date' })),
       field('Version', inp(e, 'version', { id: 'f_version', maxlength: 4 })),
@@ -383,13 +393,14 @@
     const missingKey = e.mc.filter(q => !q.answer).length;
     v.appendChild(el('div', { class: 'card ' + (pf.ok ? 'ok' : 'warn'), id: 'preflight' },
       el('h3', {}, pf.ok ? 'Preflight passed' : 'Preflight found problems'),
-      el('p', {}, `${lay.pageCount} pages (cover, ${new Set(lay.mc.map(q => q.page)).size} multiple-choice page(s), ${new Set(lay.sa.map(q => q.page)).size} written page(s)). ${pf.bubbles} bubbles checked; all bubbles and boxes inside the safe area: ${pf.problems ? 'no' : 'yes'}.`),
+      el('p', {}, `${lay.pageCount} pages (${lay.cover.compact ? 'name and student ID at the top of page 1' : 'cover'}, ${new Set(lay.mc.map(q => q.page)).size} multiple-choice page(s), ${new Set(lay.sa.map(q => q.page)).size} written page(s)). ${pf.bubbles} bubbles checked; all bubbles and boxes inside the safe area: ${pf.problems ? 'no' : 'yes'}.`),
       missingKey ? el('p', { class: 'warntext' }, `${missingKey} multiple-choice question(s) have no correct answer set.`) : null,
       pf.messages.length ? el('ul', {}, pf.messages.slice(0, 20).map(m => el('li', {}, m))) : null,
       el('p', { class: 'small muted' }, 'Print at 100% / "Actual size" on US Letter paper. Do not use "Fit to page" if your printer offers it; small scaling is tolerated.')));
     v.appendChild(el('div', { class: 'row wrap' },
       el('button', { class: 'btn primary', id: 'btnTemplatePdf', onclick: () => downloadExamPdf() }, 'Download exam PDF'),
       el('button', { class: 'btn', id: 'btnKeyPdf', onclick: () => downloadKeyPdf() }, 'Download answer key PDF'),
+      el('button', { class: 'btn', id: 'btnClassSite', onclick: () => downloadClassSite() }, 'Download for class site'),
       el('button', { class: 'btn', id: 'btnLayoutJson', onclick: () => U.download(new Blob([JSON.stringify({ exam: e.id, layout: lay }, null, 1)], { type: 'application/json' }), U.safeName(e.title) + ' - layout.json') }, 'Download layout manifest')));
     const prev = el('div', { class: 'thumbs', id: 'printPreview' }, el('p', { class: 'muted' }, 'Rendering preview...'));
     v.appendChild(el('div', { class: 'card' }, el('h3', {}, 'Preview'), prev));
@@ -412,6 +423,24 @@
     const doc = Layout.buildPDF(S.exam, L(), { key: true });
     U.download(doc.output('blob'), U.safeName(S.exam.title) + ' - answer key.pdf');
   }
+  // one file for a class site on the same origin (see CLASS_SITE_API.md): the exam definition, the teacher's key boxes, the blank PDF
+  async function downloadClassSite() {
+    const e = S.exam;
+    await Layout.loadFont();
+    await saveExam();
+    const blob = Layout.buildPDF(e, L(), {}).output('blob');
+    const pdf = (await U.blobToDataURL(blob)).split(',')[1];
+    const exam = JSON.parse(JSON.stringify(e));
+    ['layout', 'layoutSig', 'printedSig', 'keyScan', 'roster', 'created', 'updated'].forEach(k => delete exam[k]);
+    exam.kind = Layout.kindOf(e);
+    const keyBoxes = {};
+    const ks = e.keyScan;
+    (e.sa || []).forEach(q => { const k = ks && ks.sa && ks.sa[q.id]; if (k && k.b64) keyBoxes[q.id] = k.b64; });
+    const out = { app: 'examgrader', format: 1, exported: new Date().toISOString(), check: { hash: L().hash, pageCount: L().pageCount }, exam, keyBoxes, pdf };
+    U.download(new Blob([JSON.stringify(out)], { type: 'application/json' }), U.safeName(e.title) + ' - class site.json');
+    toast('Class site file downloaded', 'good');
+  }
+
   let thumbJob = 0;
   async function renderTemplateThumbs(prev, scale = 0.55) {
     const job = ++thumbJob;
@@ -445,13 +474,14 @@
     const num = (id, val, min, max) => el('input', { type: 'number', id, value: val, min, max, step: 1, inputmode: 'numeric' });
     const nMC = num('tplMC', 20, 0, 100), nSA = num('tplSA', 3, 0, 30), nDig = num('tplDigits', st.idDigits || 7, 1, 12);
     const tTitle = el('input', { type: 'text', id: 'tplTitle', placeholder: 'Optional, e.g. Exam 2', maxlength: 120 });
+    const tKind = kindSelect('exam', 'tplKind', () => { });
     const nCh = el('select', { id: 'tplChoices' }, el('option', { value: '5', selected: true }, '5 (A to E)'), el('option', { value: '4' }, '4 (A to D)'));
     const tstat = el('div', { class: 'small', id: 'tplStatus', role: 'status', 'aria-live': 'polite' });
     const lab = (t, inp) => el('label', { class: 'tplfield' }, el('span', {}, t), inp);
     const dl = async () => {
       const clamp = (x, a, b, d) => { const n = Math.round(+x.value); return isFinite(n) && x.value !== '' ? Math.max(a, Math.min(b, n)) : d; };
       const o = { mc: clamp(nMC, 0, 100, 20), sa: clamp(nSA, 0, 30, 3), choices: +nCh.value, idDigits: clamp(nDig, 1, 12, 7),
-        school: st.school, course: st.course, teacher: st.teacher, title: tTitle.value.trim(), version: 'A' };
+        school: st.school, course: st.course, teacher: st.teacher, title: tTitle.value.trim(), version: 'A', kind: tKind.value };
       try {
         tstat.textContent = 'Building the Word template...';
         const blob = await Maker.buildWordTemplate(o);
@@ -463,7 +493,7 @@
       el('div', { class: 'card tplcard', id: 'tplCardWord' },
         el('h3', {}, 'Word template (fill in Word, then upload)'),
         el('p', { class: 'small' }, 'A Word file that looks like the printed exam, with the bubbles, ID grid and answer boxes already in place. Type each question and its choices in the grey boxes, pick the correct answer from the drop-down and set the points. No AI is used to read it back.'),
-        el('div', { class: 'tplopts' }, lab('Multiple-choice questions', nMC), lab('Choices per question', nCh), lab('Written questions', nSA), lab('Student ID digits', nDig), el('label', { class: 'tplfield wide' }, el('span', {}, 'Exam title'), tTitle)),
+        el('div', { class: 'tplopts' }, lab('Type', tKind), lab('Multiple-choice questions', nMC), lab('Choices per question', nCh), lab('Written questions', nSA), lab('Student ID digits', nDig), el('label', { class: 'tplfield wide' }, el('span', {}, 'Exam title'), tTitle)),
         el('p', { class: 'small muted' }, 'School, course and teacher come from Settings. You can add or delete question blocks in Word later.'),
         el('div', { class: 'row wrap' },
           el('button', { class: 'btn', id: 'btnTplDocx', onclick: dl }, 'Download Word template'),
@@ -548,6 +578,7 @@
     v.appendChild(el('h2', {}, 'Check the imported questions'));
     v.appendChild(el('div', { class: 'card', id: 'impSummary' },
       el('p', {}, el('strong', {}, imp.src.name), el('span', { class: 'muted' }, ' | read by ' + (r.source === 'ai' ? `AI (Gemini, ${r.requests} request${r.requests > 1 ? 's' : ''}): compare with your document` : r.source === 'template' ? 'the Word template reader (no AI)' : r.source === 'pdf' ? 'the page layout reader (no AI)' : 'the document parser'))),
+      el('div', { class: 'row tight' }, el('label', { class: 'small', for: 'impKind' }, 'Type '), kindSelect(imp.kind || r.kind || 'exam', 'impKind', k => { imp.kind = k; schedulePreview(100); })),
       el('p', { id: 'impCounts' }, `${mcs.length} multiple choice (${nKey} with the correct answer), ${r.sa.length + nW} written` + (r.srcPages ? `, ${(r.pages || []).filter(p => p.kind === 'reference').length} reference page(s), ${r.mc.reduce((a, q) => a + (q.imgs || []).length + (q.choiceImgs || []).filter(Boolean).length, 0)} figure(s).` : '.')),
       imp.busy ? el('p', { class: 'warntext', id: 'impAiStatus' }, imp.busy) : null,
       imp.aiError ? el('p', { class: 'warntext', id: 'impAiError' }, 'AI reading failed: ' + imp.aiError) : null,
@@ -695,6 +726,7 @@
     const job = ++previewJob;
     try {
       const ex = Maker.toExam(newExam(), S.imp.res);
+      if (S.imp.kind) ex.kind = S.imp.kind;
       ex.layout = Layout.compute(ex);
       const doc = Layout.buildPDF(ex, ex.layout, {});
       const pdf = await pdfjsLib.getDocument({ data: doc.output('arraybuffer') }).promise;
@@ -705,7 +737,7 @@
         const c = CV.canvasOf(Math.round(vp.width), Math.round(vp.height));
         await page.render({ canvasContext: c.getContext('2d'), viewport: vp }).promise;
         const kind = (ex.layout.pages.find(x => x.no === p) || {}).kind;
-        figs.push(el('figure', { class: 'sthumb', 'data-page': p }, c, el('figcaption', {}, `Page ${p}: ` + ({ cover: 'cover (name, ID)', mc: 'multiple choice', sa: 'written', wpage: 'written page', ref: 'reference (not graded)', extra: 'original cover (not graded)' }[kind] || kind))));
+        figs.push(el('figure', { class: 'sthumb', 'data-page': p }, c, el('figcaption', {}, `Page ${p}: ` + ({ cover: 'cover (name, ID)', head: 'name, ID and questions', mc: 'multiple choice', sa: 'written', wpage: 'written page', ref: 'reference (not graded)', extra: 'original cover (not graded)' }[kind] || kind))));
         if (job !== previewJob) return;
       }
       pdf.destroy();
@@ -716,6 +748,7 @@
   async function createFromImport() {
     const imp = S.imp; if (!imp) return;
     const ex = Maker.toExam(newExam(), imp.res);
+    if (imp.kind) ex.kind = imp.kind;
     S.exam = ex; await saveExam(); await selectExam(ex.id); buildNav();
     toast(`Exam created: ${ex.mc.length} multiple choice, ${ex.sa.length} written`, 'good');
     go('make');
@@ -922,7 +955,8 @@
     scan.omr = a.mc; scan.idRead = a.id; scan.black = a.black;
     if (scan.page === 1 && canvas) {
       const n = lay.cover.name, PX = Layout.PX;
-      const x = (n.x - 2) * PX, y = (n.y - 6) * PX, w = (n.w + 4) * PX, h = (n.h + 8) * PX;
+      const top = lay.cover.compact ? 1.2 : 6;   // homework / quiz: the title line sits just above the name line
+      const x = (n.x - 2) * PX, y = (n.y - top) * PX, w = (n.w + 4) * PX, h = (n.h + top + 2) * PX;
       const cc = CV.canvasOf(Math.round(w * 0.6), Math.round(h * 0.6));
       cc.getContext('2d').drawImage(canvas, x, y, w, h, 0, 0, cc.width, cc.height);
       scan.nameCrop = cc.toDataURL('image/jpeg', 0.8);
@@ -1107,14 +1141,14 @@
         for (const [qid, r] of Object.entries(a.mc)) {
           const lq = lay.mc.find(m => m.qid === qid);
           const rec = { status: r.status, choice: r.choice, marked: r.marked, ds: r.ds };
-          if (r.status !== 'single') rec.crop = cropCanvas(c, 11, lq.top - 1.5, 185, lq.h + 1, 0.6).toDataURL('image/jpeg', 0.75);
+          if (r.status !== 'single') rec.crop = cropCanvas(c, lq.block.x - 0.5, lq.top - 1.5, lq.block.w + 0.5, lq.h + 1, 0.6).toDataURL('image/jpeg', 0.75);
           ks.mc[qid] = rec;
         }
       }
       lay.sa.filter(sq => sq.page === pn).forEach(lq => { ks.sa[lq.qid] = AI.boxCrop(c, lq); });
     }
     const missingPages = [];
-    for (let pn = 2; pn <= lay.pageCount; pn++) if (!got[pn] && !Layout.ungradedPage(lay, pn)) missingPages.push(pn);
+    for (let pn = lay.cover.compact ? 1 : 2; pn <= lay.pageCount; pn++) if (!got[pn] && !Layout.ungradedPage(lay, pn)) missingPages.push(pn);
     if (missingPages.length) warnings.push(`Key page(s) ${missingPages.join(', ')} not found in the upload.`);
     e.mc.forEach(q => {
       if (!ks.mc[q.id]) ks.mc[q.id] = { status: 'missing', choice: null, marked: [] };
@@ -1294,7 +1328,7 @@
           const lq = L().mc.find(m => m.qid === q.id);
           const scan = g.pages[lq.page];
           const im = await imgOf(scan);
-          const crop = cropCanvas(im, 11, lq.top - 1.5, 196 - 11, lq.h + 1, 1);
+          const crop = cropCanvas(im, lq.block.x - 0.5, lq.top - 1.5, lq.block.w + 0.5, lq.h + 1, 1);
           const read = scan.omr[q.id];
           const btns = el('div', { class: 'row wrap' },
             q.choices.map((c, k) => el('button', { class: 'btn choicebtn' + (r.answer === Layout.LETTERS[k] ? ' primary' : ''), 'data-choice': Layout.LETTERS[k], onclick: async () => { stu.mcOverride[q.id] = Layout.LETTERS[k]; markDraft(stu); await saveStudent(stu); render(); } }, Layout.LETTERS[k])),

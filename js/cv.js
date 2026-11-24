@@ -448,5 +448,19 @@ const CV = (() => {
     return res;
   }
 
-  return { readCode, grayOf, grayScaled, canvasOf, detectMarkers, homography, apply, warp, processSource, quickDetect, analyzePage, classify, DEFAULT_TH, sharpness };
+  // crop of one written-answer box from a rectified page (canvas/image of Layout.RW x Layout.RH): grayscale JPEG, base64 without the data: prefix
+  function boxCrop(img, lq, maxW = 900) {
+    const PX = Layout.PX, b = lq.box;
+    const sw = b.w * PX, sh = b.h * PX;
+    const k = Math.min(1, maxW / sw);
+    const c = canvasOf(Math.round(sw * k), Math.round(sh * k));
+    const ctx = c.getContext('2d');
+    ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
+    ctx.filter = 'grayscale(1)';
+    ctx.drawImage(img, b.x * PX, b.y * PX, sw, sh, 0, 0, c.width, c.height);
+    ctx.filter = 'none';
+    return { b64: c.toDataURL('image/jpeg', 0.82).split(',')[1], w: c.width, h: c.height };
+  }
+
+  return { boxCrop, readCode, grayOf, grayScaled, canvasOf, detectMarkers, homography, apply, warp, processSource, quickDetect, analyzePage, classify, DEFAULT_TH, sharpness };
 })();

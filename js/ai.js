@@ -54,19 +54,8 @@ const AI = (() => {
     try { return JSON.parse(txt); } catch (e) { return { ok: false, error: 'Server did not return JSON: ' + txt.slice(0, 120) }; }
   }
 
-  // ---- answer box crop from the rectified scan (never the cover page, never the name/ID area) ----
-  function boxCrop(img, lq, maxW = 900) {
-    const PX = Layout.PX, b = lq.box;
-    const sw = b.w * PX, sh = b.h * PX;
-    const k = Math.min(1, maxW / sw);
-    const c = CV.canvasOf(Math.round(sw * k), Math.round(sh * k));
-    const ctx = c.getContext('2d');
-    ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
-    ctx.filter = 'grayscale(1)';
-    ctx.drawImage(img, b.x * PX, b.y * PX, sw, sh, 0, 0, c.width, c.height);
-    ctx.filter = 'none';
-    return { b64: c.toDataURL('image/jpeg', 0.82).split(',')[1], w: c.width, h: c.height };
-  }
+  // ---- answer box crop from the rectified scan (never the cover page, never the name/ID area): CV.boxCrop ----
+  const boxCrop = (img, lq, maxW) => CV.boxCrop(img, lq, maxW);
 
   // ---- mark geometry: fractions of the box -> page pixels, kept inside the box ----
   function geom(m, lq) {

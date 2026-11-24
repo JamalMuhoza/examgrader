@@ -104,17 +104,49 @@ const Layout = (() => {
       if (cur.length) words.push(cur);
       doc.setFontSize(size); const sp = doc.getTextWidth(' ');
       let line = [], lw = 0;
+      const wOf = rs => rs.reduce((a, r) => a + runW(doc, r, size), 0);
       words.forEach(wd => {
-        const ww = wd.reduce((a, r) => a + runW(doc, r, size), 0);
-        if (line.length && lw + sp + ww > width) { lines.push({ runs: line }); line = []; lw = 0; }
-        if (line.length) { line.push({ t: ' ', k: 0 }); lw += sp; }
-        line.push(...wd); lw += ww;
+        const ww = wOf(wd);
+        // a word wider than the line is broken (after ')' or before '(' when possible); its pieces join without a space
+        (ww > width ? breakWord(doc, wd, width, size) : [wd]).forEach((pc, pi) => {
+          const pw = pi ? wOf(pc) : (pc === wd ? ww : wOf(pc)), sep = pi ? 0 : sp;
+          if (line.length && lw + sep + pw > width) { lines.push({ runs: line }); line = []; lw = 0; }
+          if (line.length && sep) { line.push({ t: ' ', k: 0 }); lw += sp; }
+          line.push(...pc); lw += pw;
+        });
       });
       if (line.length) lines.push({ runs: line });
     });
     doc.setFontSize(size);
     while (lines.length && lines[lines.length - 1] === '') lines.pop();
     return lines;
+  }
+  // split one over-long word (array of runs) into pieces no wider than width: breaks after ')' or before '(' first, then anywhere
+  function breakWord(doc, wd, width, size) {
+    const segs = []; let cur = [];
+    wd.forEach(r => {
+      if (r.k) { cur.push(r); return; }
+      r.t.split(/(?<=\))|(?=\()/).forEach((f, i) => { if (!f) return; if (i && cur.length) { segs.push(cur); cur = []; } cur.push({ t: f, k: 0 }); });
+    });
+    if (cur.length) segs.push(cur);
+    const wOf = rs => rs.reduce((a, r) => a + runW(doc, r, size), 0);
+    const pieces = []; let pc = [], pw = 0;
+    const flush = () => { if (pc.length) pieces.push(pc); pc = []; pw = 0; };
+    segs.forEach(sg => {
+      const w = wOf(sg);
+      if (pw + w <= width) { pc.push(...sg); pw += w; return; }
+      flush();
+      if (w <= width) { pc.push(...sg); pw = w; return; }
+      sg.forEach(r => [...r.t].forEach(ch => {   // a segment wider than the line: break between characters
+        const c = { t: ch, k: r.k }, cw = runW(doc, c, size);
+        if (pw + cw > width && pc.length) flush();
+        const last = pc[pc.length - 1];
+        if (last && last.k === c.k) last.t += ch; else pc.push(c);
+        pw += cw;
+      }));
+    });
+    flush();
+    return pieces;
   }
   function drawRuns(doc, runs, x, y, size) {
     runs.forEach(r => {
@@ -127,9 +159,18 @@ const Layout = (() => {
   }
 
   // ---------- text helpers ----------
+  // width of one line of (rich) text in mm
+  function textW(doc, text, size, uni) {
+    if (!String(text || '').trim()) return 0;
+    if (hasMarkup(text)) { setF(doc, 'normal', uni); const ln = richWrap(doc, text, 1e5, size, 'normal', uni)[0]; return ln && ln.runs ? ln.runs.reduce((a, r) => a + runW(doc, r, size), 0) : 0; }
+    setF(doc, 'normal', uni); doc.setFontSize(size);
+    return doc.getTextWidth(uni ? String(text) : U.pdfText(text));
+  }
   function wrap(doc, text, width, size, style = 'normal', uni = false) {
     if (hasMarkup(text)) return richWrap(doc, text, width, size, style, uni);
     setF(doc, style, uni); doc.setFontSize(size);
+    // a token wider than the line: the rich wrapper breaks it at a sensible place (never past the column edge)
+    if ((uni ? String(text || '') : U.pdfText(text)).split(/\s+/).some(t => t && doc.getTextWidth(t) > width)) return richWrap(doc, text, width, size, style, uni);
     const paras = (uni ? String(text || '') : U.pdfText(text)).replace(/\r/g, '').split('\n');
     const lines = [];
     for (const p of paras) {
@@ -149,45 +190,75 @@ const Layout = (() => {
       hash: examHash(exam), pages: [], mc: [], sa: [], cover: null, texts: [], issues: []
     };
     const PT = 25.4 / 72;   // mm per PDF point (pictures cut from the teacher's PDF)
-    // ---- cover ----
+    // ---- cover (exam) or a compact header strip on page 1 (homework, quiz) ----
     const nd = Math.max(1, Math.min(12, exam.idDigits | 0 || 7));
-    const cover = { page: 1 };
-    cover.name = { x: CONTENT.left, y: 74, w: 112, h: 14 };
-    cover.score = { x: 146, y: 74, w: 50, h: 30 };
-    const idTop = 110;
-    const colW = 7.2;
-    const idX0 = CONTENT.left + 4;
-    cover.idBox = { x: CONTENT.left, y: idTop, w: nd * colW + 8, h: 0 };
-    cover.id = { r: BUB_R, cols: [] };
-    for (let c = 0; c < nd; c++) {
-      const x = idX0 + c * colW + colW / 2;
-      const write = { x: x - 3, y: idTop + 7, w: 6, h: 7 };
-      const bubbles = [];
-      for (let d = 0; d < 10; d++) bubbles.push({ d, x, y: idTop + 19 + d * 6.2 });
-      cover.id.cols.push({ c, x, write, bubbles });
+    const compact = isCompact(exam);
+    L.kind = kindOf(exam);
+    let headEnd = null;
+    if (compact) {
+      const cover = { page: 1, compact: true };
+      cover.name = { x: CONTENT.left, y: 37.4, w: 110, h: 8 };       // writing area; the Name line is its bottom edge
+      cover.score = { x: 146, y: 36.6, w: 50, h: 9.6 };
+      // flat student ID: one horizontal row of bubbles 0-9 per digit, rows stacked in up to two blocks side by side
+      const idTop = 52.4, rowH = 6.2, pitch = 6.0, blockW = 86;
+      const per = nd <= 3 ? nd : Math.ceil(nd / 2);
+      cover.idBox = { x: CONTENT.left, y: idTop, w: CONTENT.right - CONTENT.left, h: per * rowH + 1.6 };
+      cover.id = { r: BUB_R, cols: [], flat: true };
+      for (let c = 0; c < nd; c++) {
+        const bx = CONTENT.left + Math.floor(c / per) * blockW, cy = idTop + 0.8 + rowH / 2 + (c % per) * rowH;
+        const write = { x: bx + 6, y: cy - 2.9, w: 6, h: 5.8 };
+        const bubbles = [];
+        for (let d = 0; d < 10; d++) bubbles.push({ d, x: bx + 17.5 + d * pitch, y: cy });
+        cover.id.cols.push({ c, x: write.x + write.w / 2, y: cy, label: { x: bx + 2.6, y: cy }, write, bubbles });
+      }
+      cover.end = cover.idBox.y + cover.idBox.h + 2.6;   // separator line under the strip
+      L.cover = cover;
+      L.pages.push({ no: 1, kind: 'head' });
+      headEnd = cover.end + 3.4;
+    } else {
+      const cover = { page: 1 };
+      cover.name = { x: CONTENT.left, y: 74, w: 112, h: 14 };
+      cover.score = { x: 146, y: 74, w: 50, h: 30 };
+      const idTop = 110;
+      const colW = 7.2;
+      const idX0 = CONTENT.left + 4;
+      cover.idBox = { x: CONTENT.left, y: idTop, w: nd * colW + 8, h: 0 };
+      cover.id = { r: BUB_R, cols: [] };
+      for (let c = 0; c < nd; c++) {
+        const x = idX0 + c * colW + colW / 2;
+        const write = { x: x - 3, y: idTop + 7, w: 6, h: 7 };
+        const bubbles = [];
+        for (let d = 0; d < 10; d++) bubbles.push({ d, x, y: idTop + 19 + d * 6.2 });
+        cover.id.cols.push({ c, x, write, bubbles });
+      }
+      cover.idBox.h = 19 + 10 * 6.2 + 1;
+      cover.instr = { x: cover.idBox.x + cover.idBox.w + 8, y: idTop, w: CONTENT.right - (cover.idBox.x + cover.idBox.w + 8) };
+      L.cover = cover;
+      L.pages.push({ no: 1, kind: 'cover' });
     }
-    cover.idBox.h = 19 + 10 * 6.2 + 1;
-    cover.instr = { x: cover.idBox.x + cover.idBox.w + 8, y: idTop, w: CONTENT.right - (cover.idBox.x + cover.idBox.w + 8) };
-    L.cover = cover;
-    L.pages.push({ no: 1, kind: 'cover' });
 
     // ---- pages kept from the teacher's document in front of the questions (for example the original cover) ----
     let page = 1, y = CONTENT.bottom + 1;
     const newPage = (kind) => { page++; L.pages.push({ no: page, kind }); y = CONTENT.top; };
     const fitBox = (img, maxW, maxH) => { const w0 = img.wpt * PT, h0 = img.hpt * PT, k = Math.min(1, maxW / w0, maxH / h0); return { w: w0 * k, h: h0 * k }; };
     L.extra = [];
-    (exam.frontPages || []).forEach(fp => {
+    // homework / quiz: the questions start under the header strip; pages kept from the teacher's document go after the questions
+    const frontPages = () => (exam.frontPages || []).forEach(fp => {
       newPage('extra');
       const f = fitBox(fp.img, CONTENT.right - CONTENT.left, CONTENT.bottom - CONTENT.top);
       L.extra.push({ id: fp.id, page, kind: 'extra', img: { x: CONTENT.left + (CONTENT.right - CONTENT.left - f.w) / 2, y: CONTENT.top, w: f.w, h: f.h } });
       y = CONTENT.bottom + 1;
     });
+    if (compact) y = headEnd; else frontPages();
 
     // ---- MC pages ----
     const mcs = exam.mc || [];
     const STEM_PT = 10.5, CH_PT = 10, STEM_LH = lh(STEM_PT), CH_LH = lh(CH_PT);
-    const stemX = 31, stemW = CONTENT.right - stemX;
-    const bubX = 34, chX = 39.5, chW = CONTENT.right - chX;
+    // homework / quiz: two columns filled column by column (a question never splits); exam: one column
+    const stemX = 31, bubX = 34, chX = 39.5;
+    const COLDX = 89, COL2_X0 = 108.5;
+    const FLAT_TXT = BUB_R + (chX - bubX), FLAT_GAP = 5.2;  // side-by-side choices: bubble edge to text, text end to the next bubble edge (room for marks)                     // column 2 offset; left edge of column 2's mark lane
+    const stemW = compact ? 76 : CONTENT.right - stemX, chW = stemW - (chX - stemX);
     // original look: one scale for every cut-out so the type size stays even (shrunk only when the widest piece needs it)
     const lookOn = q => exam.keepLook !== false && q.look && !q.useText && (q.look.stem || (q.look.choices || []).some(Boolean));
     let maxS = 0, maxC = 0;
@@ -195,6 +266,7 @@ const Layout = (() => {
     const LS = Math.min(1, maxS ? stemW / maxS : 1, maxC ? chW / maxC : 1);
     L.lookScale = LS;
     const imgsH = (imgs, w) => (imgs || []).filter(Boolean).reduce((a, im) => a + fitBox(im, w, 70).h + 1.2, 0);
+    const placed = [];
     mcs.forEach((q, qi) => {
       const look = lookOn(q);
       const uni = !look && exam.uniText === true && !!UNI;   // one font for every question (symbols and scripts print the same everywhere)
@@ -215,7 +287,19 @@ const Layout = (() => {
       const sImgs = (!look ? (q.imgs || []) : []).filter(Boolean).map(im => fitBox(im, stemW, 70));
       stemH += sImgs.reduce((a, f) => a + f.h + 1.2, 0);
       const rows = [], chs = [];
-      for (let i = 0; i < nCh; i++) {
+      // homework / quiz: short one-line choices side by side (A B C / D E), each bubble beside its choice
+      let flat = null;
+      if (compact && !look && !(q.choiceImgs || []).some(Boolean)) {
+        const texts = Array.from({ length: nCh }, (_, i) => String((q.choices || [])[i] || ''));
+        const avail = stemX + stemW - (bubX - BUB_R) + FLAT_GAP;
+        const cell = FLAT_TXT + Math.max(...texts.map(t => textW(doc, t, CH_PT, uni))) + FLAT_GAP;
+        let per = Math.min(nCh, Math.floor(avail / cell));
+        if (per >= 2 && !texts.some(t => /\n/.test(t))) {
+          const nRows = Math.ceil(nCh / per); per = Math.ceil(nCh / nRows);
+          flat = { per, nRows, cw: avail / per, lines: texts.map(t => wrap(doc, t, 1000, CH_PT, 'normal', uni)) };
+        }
+      }
+      for (let i = 0; i < nCh && !flat; i++) {
         const cc = look ? (q.look.choices || [])[i] : null;
         if (cc) {
           let w = cc.wpt * PT * LS, h = cc.hpt * PT * LS; const k = Math.min(1, chW / w); w *= k; h *= k;
@@ -232,31 +316,71 @@ const Layout = (() => {
           rows.push(Math.max(6.4, ci && !ls.length ? ci.h + 2.6 : Math.max(1, ls.length) * CH_LH + 2.0 + (ci ? ci.h + 1.2 : 0)));
         }
       }
-      const h = stemH + rows.reduce((a, b) => a + b, 0) + 3.2;
+      const h = stemH + (flat ? flat.nRows * 6.4 : rows.reduce((a, b) => a + b, 0)) + 3.2;
       if (h > CONTENT.bottom - CONTENT.top) L.issues.push(`MC ${qi + 1} is taller than a full page; shorten its text.`);
-      if (y + h > CONTENT.bottom) newPage('mc');
-      const top = y;
-      const item = { qid: q.id, num: qi + 1, label: q.label || String(qi + 1), page, r: BUB_R, top, h, stem: { x: stemX, y: top, lines: stemLines }, choices: [], lane: { x0: 11.5, x1: bubX - BUB_R - 0.6 }, uni, look };
-      if (stemImg) { item.stem.img = { x: stemX, y: top + stemImg.dy, w: stemImg.w, h: stemImg.h }; item.stem.numY = top + numY; }
-      let iy = top + (stemImg ? stemImg.dy + stemImg.h + 0.6 : Math.max(1, stemLines.length) * STEM_LH + 0.6);
-      if (sImgs.length) item.stem.imgs = sImgs.map(f => { const r = { x: stemX, y: iy, w: f.w, h: f.h }; iy += f.h + 1.2; return r; });
-      let cy = top + stemH;
-      for (let i = 0; i < nCh; i++) {
-        const c = chs[i];
-        const ch = { label: LETTERS[i], x: bubX, y: cy + c.by, text: { x: chX, y: cy + 3.2 + 1.25, lines: c.lines }, rowTop: cy, rowH: rows[i] };
-        if (c.img) ch.img = { x: chX, y: cy + c.img.dy, w: c.img.w, h: c.img.h };
-        if (c.cimg) ch.cimg = { x: chX, y: cy + (c.lines.length ? c.lines.length * CH_LH + 1.6 : 1.0), w: c.cimg.w, h: c.cimg.h };
-        item.choices.push(ch);
-        cy += rows[i];
-      }
-      item.block = { x: 11.5, y: top - 1, w: CONTENT.right - 11.5, h: h - 1.5 };
-      L.mc.push(item);
-      y = top + h;
+      placed.push({ h, make: (top, page, col) => {
+        const ox = col * COLDX, sx = stemX + ox;
+        const item = { qid: q.id, num: qi + 1, label: q.label || String(qi + 1), page, r: BUB_R, top, h, stem: { x: sx, y: top, lines: stemLines }, choices: [], lane: { x0: col ? COL2_X0 : 11.5, x1: bubX + ox - BUB_R - 0.6 }, uni, look };
+        if (compact) { item.col = col; item.numX = 29.5 + ox; }
+        if (stemImg) { item.stem.img = { x: sx, y: top + stemImg.dy, w: stemImg.w, h: stemImg.h }; item.stem.numY = top + numY; }
+        let iy = top + (stemImg ? stemImg.dy + stemImg.h + 0.6 : Math.max(1, stemLines.length) * STEM_LH + 0.6);
+        if (sImgs.length) item.stem.imgs = sImgs.map(f => { const r = { x: sx, y: iy, w: f.w, h: f.h }; iy += f.h + 1.2; return r; });
+        let cy = top + stemH;
+        if (flat) {
+          item.flat = true;
+          for (let i = 0; i < nCh; i++) {
+            const rt = top + stemH + Math.floor(i / flat.per) * 6.4, bx = bubX + ox + (i % flat.per) * flat.cw;
+            item.choices.push({ label: LETTERS[i], x: bx, y: rt + 3.2, text: { x: bx + (chX - bubX), y: rt + 3.2 + 1.25, lines: flat.lines[i] }, rowTop: rt, rowH: 6.4 });
+          }
+        }
+        for (let i = 0; i < nCh && !flat; i++) {
+          const c = chs[i];
+          const ch = { label: LETTERS[i], x: bubX + ox, y: cy + c.by, text: { x: chX + ox, y: cy + 3.2 + 1.25, lines: c.lines }, rowTop: cy, rowH: rows[i] };
+          if (c.img) ch.img = { x: chX + ox, y: cy + c.img.dy, w: c.img.w, h: c.img.h };
+          if (c.cimg) ch.cimg = { x: chX + ox, y: cy + (c.lines.length ? c.lines.length * CH_LH + 1.6 : 1.0), w: c.cimg.w, h: c.cimg.h };
+          item.choices.push(ch);
+          cy += rows[i];
+        }
+        item.block = col ? { x: COL2_X0, y: top - 1, w: CONTENT.right - COL2_X0, h: h - 1.5 } : { x: 11.5, y: top - 1, w: (compact ? stemX + stemW : CONTENT.right) - 11.5, h: h - 1.5 };
+        return item;
+      } });
     });
+    // place the measured questions: one column (exam) or two columns filled column by column (homework, quiz)
+    let col = 0, colTop = y;
+    const spots = placed.map(m => {
+      if (y + m.h > CONTENT.bottom) {
+        if (compact && col === 0 && colTop + m.h <= CONTENT.bottom) { col = 1; y = colTop; }
+        else { newPage('mc'); col = 0; colTop = y; }
+      }
+      const sp = { m, page, col, top: y, colTop };
+      y += m.h;
+      return sp;
+    });
+    let mcEnd = y;
+    if (compact && spots.length) {
+      // last page: balance the two columns (order kept: the first k questions left) so the written answers can follow below
+      const last = spots.filter(sp => sp.page === page), top0 = last[0].colTop, avail = CONTENT.bottom - top0;
+      const hs = last.map(sp => sp.m.h), tot = hs.reduce((a, b) => a + b, 0);
+      let best = null, left = 0;
+      for (let k = 1; k <= hs.length; k++) {
+        left += hs[k - 1];
+        if (left > avail + 1e-6 || tot - left > avail + 1e-6) continue;
+        const v = Math.max(left, tot - left);
+        if (!best || v < best.v - 1e-6) best = { k, v };
+      }
+      if (best) {
+        let yl = top0, yr = top0;
+        last.forEach((sp, i) => { if (i < best.k) { sp.col = 0; sp.top = yl; yl += sp.m.h; } else { sp.col = 1; sp.top = yr; yr += sp.m.h; } });
+        mcEnd = top0 + best.v;
+      } else mcEnd = Math.max(...last.map(sp => sp.top + sp.m.h));
+    }
+    spots.forEach(sp => L.mc.push(sp.m.make(sp.top, sp.page, sp.col)));
+    y = mcEnd;
 
     // ---- short-answer pages ----
     const sas = exam.sa || [];
-    if (sas.length) y = CONTENT.bottom + 1;
+    if (sas.length && !compact) y = CONTENT.bottom + 1;
+    else if (sas.length && mcs.length) y = mcEnd + 2;   // homework / quiz: written answers follow the questions on the same page
     const P_PT = 10.5, P_LH = lh(P_PT);
     sas.forEach((q, qi) => {
       if (q.kind === 'page' && q.img) {
@@ -276,8 +400,8 @@ const Layout = (() => {
         return;
       }
       const uni = exam.uniText === true && !!UNI;
-      const lines = q.prompt && q.prompt.trim() && !q.img ? wrap(doc, q.prompt, stemW, P_PT, 'normal', uni) : (q.img ? [] : ['']);
-      const pImgs = [q.img, ...(q.imgs || [])].filter(Boolean).map(im => fitBox(im, stemW, 90));
+      const lines = q.prompt && q.prompt.trim() && !q.img ? wrap(doc, q.prompt, CONTENT.right - stemX, P_PT, 'normal', uni) : (q.img ? [] : ['']);
+      const pImgs = [q.img, ...(q.imgs || [])].filter(Boolean).map(im => fitBox(im, CONTENT.right - stemX, 90));
       const boxH = Math.max(1, q.lines || 6) * 8;
       const promptH = (lines.length ? lines.length * P_LH : 0) + pImgs.reduce((a, f) => a + f.h + 1.2, 0) + 2.0;
       const h = promptH + boxH + 9 + 3;
@@ -296,6 +420,24 @@ const Layout = (() => {
       L.sa.push(item);
       y = top + h;
     });
+    // homework / quiz: the free space at the bottom of each written-answer page goes to its answer boxes
+    if (compact) {
+      const byPage = {};
+      L.sa.filter(s => s.kind !== 'page').forEach(s => (byPage[s.page] = byPage[s.page] || []).push(s));
+      Object.values(byPage).forEach(items => {
+        const free = CONTENT.bottom - Math.max(...items.map(s => s.region.y + s.region.h)) - 0.5;
+        if (free < 1) return;
+        const add = free / items.length;
+        let dy = 0;
+        items.forEach(s => {
+          s.top += dy; s.prompt.y += dy; (s.prompt.imgs || []).forEach(r => { r.y += dy; });
+          s.box.y += dy; s.box.h += add; s.scoreBox.y += dy; s.comment.y += dy + add;
+          s.region.y += dy; s.region.h += add;
+          dy += add;
+        });
+      });
+      frontPages();
+    }
     // ---- reference pages (printed, never graded) ----
     (exam.refPages || []).forEach(rp => {
       newPage('ref');
@@ -307,6 +449,11 @@ const Layout = (() => {
     preflight(L);
     return L;
   }
+
+  // assignment type: 'exam' (cover page) | 'homework' | 'quiz' (compact header on page 1); old exams have no kind
+  const KINDS = ['exam', 'quiz', 'homework'];
+  function kindOf(exam) { return exam && KINDS.includes(exam.kind) ? exam.kind : 'exam'; }
+  function isCompact(exam) { return kindOf(exam) !== 'exam'; }
 
   function inSafe(x, y) { return x >= SAFE.x0 && x <= SAFE.x1 && y >= SAFE.y0 && y <= SAFE.y1; }
   function preflight(L) {
@@ -323,7 +470,7 @@ const Layout = (() => {
       if (c.text.x < c.x + q.r + 1.5) { bad++; rep.push(`MC ${q.num}${c.label} text overlaps its bubble`); }
     }));
     // bubbles of one question must not overlap each other
-    L.mc.forEach(q => { for (let i = 1; i < q.choices.length; i++) if (q.choices[i].y - q.choices[i - 1].y < 2 * q.r + 0.8) { bad++; rep.push(`MC ${q.num} bubbles too close`); } });
+    L.mc.forEach(q => { for (let i = 1; i < q.choices.length; i++) if (Math.hypot(q.choices[i].x - q.choices[i - 1].x, q.choices[i].y - q.choices[i - 1].y) < 2 * q.r + 0.8) { bad++; rep.push(`MC ${q.num} bubbles too close`); } });
     L.sa.forEach(s => {
       const b = s.box;
       if (!inSafe(b.x, b.y) || !inSafe(b.x + b.w, b.y + b.h)) { bad++; rep.push(`SA ${s.label} box outside the safe area`); }
@@ -378,13 +525,13 @@ const Layout = (() => {
     for (let p = 1; p <= L.pageCount; p++) {
       if (p > 1) doc.addPage('letter', 'portrait');
       drawFrame(doc, L, exam, p);
-      if (p === 1) drawCover(doc, L, exam, key);
+      if (p === 1) { if (L.cover.compact) drawHead(doc, L, exam, key); else drawCover(doc, L, exam, key); }
       const mcById = {}; (exam.mc || []).forEach(q => { mcById[q.id] = q; });
       const pic = (im, r, alias) => { if (im && im.src && r) { try { doc.addImage(im.src, imgFmt(im.src), r.x, r.y, r.w, r.h, alias); } catch (e) { console.error('image', alias, e); } } };
       L.mc.filter(q => q.page === p).forEach(q => {
         const src = mcById[q.qid] || {};
         doc.setFont('helvetica', 'bold'); doc.setFontSize(10.5); doc.setTextColor(20);
-        doc.text((q.label || q.num) + '.', 29.5, q.stem.numY || q.stem.y + 3.7, { align: 'right' });
+        doc.text((q.label || q.num) + '.', q.numX || 29.5, q.stem.numY || q.stem.y + 3.7, { align: 'right' });
         if (q.stem.img) pic(src.look && src.look.stem, q.stem.img, q.qid + ':s');
         else textLines(doc, q.stem.lines, q.stem.x, q.stem.y + 3.7, 10.5, 'normal', lh(10.5), 20, q.uni);
         (q.stem.imgs || []).forEach((r, k) => pic((src.imgs || [])[k], r, q.qid + ':si' + k));
@@ -501,6 +648,46 @@ const Layout = (() => {
     doc.text('Do not write on the black squares or the small code squares at the top of each page.', CONTENT.left, 252);
   }
 
+  // homework / quiz page 1: title, date, version; name and score; flat student ID grid
+  function drawHead(doc, L, exam, key) {
+    const C = L.cover;
+    doc.setTextColor(15); doc.setFont('helvetica', 'bold'); doc.setFontSize(13);
+    const meta = [exam.date ? 'Date: ' + exam.date : 'Date ____________', exam.version ? 'Version ' + exam.version : ''].filter(Boolean).join('     ');
+    doc.setFont('helvetica', 'normal'); doc.setFontSize(10);
+    const metaW = meta ? doc.getTextWidth(U.pdfText(meta)) + 6 : 0;
+    doc.setFont('helvetica', 'bold'); doc.setFontSize(13);
+    const title = U.pdfText(exam.title || (L.kind === 'quiz' ? 'Quiz' : 'Homework')) + (key ? '  (ANSWER KEY)' : '');
+    doc.text(doc.splitTextToSize(title, CONTENT.right - CONTENT.left - metaW)[0] || '', CONTENT.left, 33.4);
+    if (meta) { doc.setFont('helvetica', 'normal'); doc.setFontSize(10); doc.setTextColor(50); doc.text(U.pdfText(meta), CONTENT.right, 33.4, { align: 'right' }); }
+    // name line
+    const n = C.name;
+    doc.setTextColor(30); doc.setFont('helvetica', 'bold'); doc.setFontSize(10);
+    doc.text('Name', n.x, n.y + n.h - 1.2);
+    doc.setDrawColor(60); doc.setLineWidth(0.3); doc.line(n.x + 11, n.y + n.h - 0.6, n.x + n.w, n.y + n.h - 0.6);
+    // score box: Score ____ / total
+    const sb = C.score;
+    const total = (exam.mc || []).reduce((a, q) => a + (+q.points || 0), 0) + (exam.sa || []).reduce((a, q) => a + (+q.max || 0), 0);
+    doc.setDrawColor(60); doc.setLineWidth(0.35); doc.rect(sb.x, sb.y, sb.w, sb.h, 'S');
+    doc.text('Score', sb.x + 2, sb.y + 6.4);
+    doc.setLineWidth(0.25); doc.line(sb.x + 15, sb.y + 7.2, sb.x + 31, sb.y + 7.2);
+    doc.setFont('helvetica', 'normal'); doc.text('/ ' + U.fmt(total), sb.x + 32.5, sb.y + 6.4);
+    // student ID: one row of bubbles per digit
+    const B = C.idBox;
+    doc.setTextColor(30); doc.setFont('helvetica', 'bold'); doc.setFontSize(9.5);
+    doc.text('Student ID', B.x, B.y - 1.6);
+    doc.setFont('helvetica', 'normal'); doc.setFontSize(7.5); doc.setTextColor(110);
+    doc.text('Write each digit in its box, then fill the bubble for that digit in the same row (row 1 = first digit).', B.x + 20, B.y - 1.6);
+    doc.setDrawColor(150); doc.setLineWidth(0.25); doc.rect(B.x, B.y, B.w, B.h, 'S');
+    C.id.cols.forEach(col => {
+      doc.setFont('helvetica', 'bold'); doc.setFontSize(7.5); doc.setTextColor(90);
+      doc.text(String(col.c + 1), col.label.x, col.label.y + 1, { align: 'center' });
+      doc.setDrawColor(110); doc.setLineWidth(0.25);
+      doc.rect(col.write.x, col.write.y, col.write.w, col.write.h, 'S');
+      col.bubbles.forEach(b => bubble(doc, b.x, b.y, C.id.r, b.d, false));
+    });
+    doc.setDrawColor(190); doc.setLineWidth(0.25); doc.line(CONTENT.left, C.end, CONTENT.right, C.end);
+  }
+
   function defaultInstructions(exam) {
     return 'Write your name in the box and your student ID in the grid, filling one bubble per digit.\n' +
       'For multiple choice, completely fill the one bubble next to your answer with a dark pencil or pen. Erase changes cleanly.\n' +
@@ -515,5 +702,5 @@ const Layout = (() => {
   // pages that are printed but never graded (kept cover art, reference pages): a student may hand them in or not
   function ungradedPage(L, p) { const pg = (L.pages || []).find(x => x.no === p); return !!pg && (pg.kind === 'ref' || pg.kind === 'extra'); }
 
-  return { PAGE, DPI, PX, RW, RH, MK, MARKERS, CODE, SAFE, CONTENT, BUB_R, LETTERS, compute, buildPDF, preflight, codeBits, decodeBits, codeCells, examHash, mm2px, px2mm, loadFont, needsUni, ungradedPage, fontReady: () => !!UNI, runsOf, hasMarkup };
+  return { PAGE, DPI, PX, RW, RH, MK, MARKERS, CODE, SAFE, CONTENT, BUB_R, LETTERS, compute, buildPDF, preflight, codeBits, decodeBits, codeCells, examHash, mm2px, px2mm, loadFont, needsUni, ungradedPage, kindOf, isCompact, KINDS, fontReady: () => !!UNI, runsOf, hasMarkup };
 })();

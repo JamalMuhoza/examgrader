@@ -798,7 +798,7 @@ const Maker = (() => {
     }
   }
 
-  // Build the Word template for the counts the teacher picked. o = { mc, choices (4|5), sa, idDigits, school, course, teacher, title, date, version }
+  // Build the Word template for the counts the teacher picked. o = { mc, choices (4|5), sa, idDigits, school, course, teacher, title, date, version, kind }
   async function buildWordTemplate(o = {}) {
     const nMC = Math.max(0, Math.min(100, o.mc | 0)), nSA = Math.max(0, Math.min(30, o.sa | 0));
     if (nMC + nSA < 1) throw new Error('Choose at least one question');
@@ -875,6 +875,9 @@ const Maker = (() => {
     const tot = { NMC: nMC, MCPTS: nMC, NSA: nSA, SAPTS: nSA * 5, TOTAL: nMC + nSA * 5 };
     xml = xml.replace(/\{(NMC|MCPTS|NSA|SAPTS|TOTAL)\}/g, (m, k) => String(tot[k]));
     zip.file('word/document.xml', xml);
+    // the assignment type travels in the document properties (Category) and is read back on upload
+    const core = zip.file('docProps/core.xml');
+    if (core && o.kind && o.kind !== 'exam') zip.file('docProps/core.xml', (await core.async('string')).replace(/<cp:category\/>|<cp:category>[^<]*<\/cp:category>/, `<cp:category>examgrader-kind:${o.kind}</cp:category>`));
     const hdrLine = esc([o.title || 'Exam title', o.course].filter(x => x && String(x).trim()).join('  |  '));
     for (const n of Object.keys(zip.files).filter(n => /^word\/header\d+\.xml$/.test(n))) {
       const s = await zip.file(n).async('string');
@@ -892,6 +895,9 @@ const Maker = (() => {
     const tagged = Array.from(doc.getElementsByTagNameNS(W, 'sdt')).map(s => ({ s, tag: sdtTag(s).trim() })).filter(x => x.tag);
     if (!tagged.some(x => x.tag === 'mc_stem' || x.tag === 'sa_prompt')) return null;
     const res = { title: '', fields: {}, mc: [], sa: [], warnings: [], skipped: [], keyApplied: 0, source: 'template' };
+    const core = zip.file('docProps/core.xml');
+    const km = core ? (await core.async('string')).match(/<cp:category>examgrader-kind:(\w+)<\/cp:category>/) : null;
+    if (km && ['quiz', 'homework'].includes(km[1])) res.kind = km[1];
     const num = v => { const m = String(v).replace(',', '.').match(/-?\d+(?:\.\d+)?/); return m ? +m[0] : null; };
     let cur = null;
     const pics = [];
@@ -1033,6 +1039,7 @@ const Maker = (() => {
   function toExam(exam, imp) {
     const f = imp.fields || {};
     if (imp.title || f.title) exam.title = imp.title || f.title;
+    if (imp.kind) exam.kind = imp.kind;
     if (f.school) exam.school = f.school;
     if (f.course) exam.course = f.course;
     if (f.teacher) exam.teacher = f.teacher;

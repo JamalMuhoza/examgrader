@@ -135,6 +135,24 @@ const Annot = (() => {
       const laneX0 = q.lane.x0 * s;
       const target = key ? { x: key.x - rad - 0.9 * s, y: key.y } : null;
       if (r.state === 'review') continue;
+      if (q.flat) {
+        // homework / quiz choices side by side: small marks left of the bubbles
+        // the right answer gets a hand-drawn ring (an arrow across the other choices would be hard to read)
+        const ring = () => { const rr = rad + 1.1 * s, a0 = -2.2 + j(R, 0.3), pts = [];
+          for (let k = 0; k <= 34; k++) { const t = a0 + (k / 34) * (Math.PI * 2 + 0.5); pts.push([key.x + Math.cos(t) * rr * (1 + j(R, 0.03)), key.y + Math.sin(t) * rr * 0.92]); }
+          penStroke(ctx, pts, W * 0.9, { start: 0.5, end: 0.4 }); };
+        if (r.state === 'correct') { const b = px(ch[r.answer]); check(ctx, b.x - rad - 0.6 * s, b.y + 0.4 * s, s * 0.8, R, W); }
+        else if (r.state === 'wrong' || r.state === 'multiple') {
+          const marks = (r.state === 'multiple' ? (r.marked || []).filter(l => l !== r.key) : [r.answer]).filter(l => ch[l]);
+          marks.forEach(l => { const b = px(ch[l]); cross(ctx, b.x - rad - 2.6 * s, b.y, s, R, W, 0.85); });
+          if (key && marks.length) ring();
+        } else if (r.state === 'blank') {
+          const first = px(q.choices[0]);
+          dash(ctx, first.x - rad - 2.6 * s, first.y - 0.2 * s, s, R, W);
+          if (key) ring();
+        }
+        continue;
+      }
       if (r.state === 'correct') {
         const b = px(ch[r.answer]);
         check(ctx, b.x - rad - 1.6 * s, b.y + 0.4 * s, s * 1.2, R, W);
@@ -178,9 +196,15 @@ const Annot = (() => {
     }
     if (pageNo === 1 && L.cover && g.total !== undefined) {
       const sb = L.cover.score, R = U.rng(stu.id + ':total');
-      const cx = (sb.x + sb.w / 2) * s;
-      hand(ctx, `${U.fmt(g.total)}/${U.fmt(g.max)}`, cx, (sb.y + 15.5) * s, 11 * s, R, { align: 'center', rot: -0.04 });
-      hand(ctx, `(${U.fmt(g.pct)}%)`, cx + 1 * s, (sb.y + 24.5) * s, 6.4 * s, R, { align: 'center', rot: -0.03 });
+      if (L.cover.compact) {
+        // homework / quiz header: "Score ____ / total" in one line; the total goes on the blank, the percent at the right
+        hand(ctx, U.fmt(g.total), (sb.x + 23) * s, (sb.y + 6.6) * s, 6.4 * s, R, { align: 'center', rot: -0.03 });
+        hand(ctx, `(${U.fmt(g.pct)}%)`, (sb.x + sb.w - 2) * s, (sb.y + 6.6) * s, 3.1 * s, R, { align: 'right', rot: -0.02 });
+      } else {
+        const cx = (sb.x + sb.w / 2) * s;
+        hand(ctx, `${U.fmt(g.total)}/${U.fmt(g.max)}`, cx, (sb.y + 15.5) * s, 11 * s, R, { align: 'center', rot: -0.04 });
+        hand(ctx, `(${U.fmt(g.pct)}%)`, cx + 1 * s, (sb.y + 24.5) * s, 6.4 * s, R, { align: 'center', rot: -0.03 });
+      }
     }
     // free ink and stamps (teacher)
     const ink = (stu.ink && stu.ink[pageNo]) || [];
