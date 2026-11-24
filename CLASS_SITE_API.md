@@ -13,6 +13,7 @@ A page on the same origin (for example `/iob/`, `/bio1/`, `/introchem/`) can pri
 <script src="/examgrader/js/eglib.js"></script>
 ```
 
+- The page must declare `<meta charset="utf-8">` (the scripts contain Unicode characters; without it util.js fails to parse).
 - Classic scripts, no modules, no build step. Lazy loading is fine: insert the tags one after another and wait for each `onload`.
 - None of them touch IndexedDB or the app UI at load time. `js/app.js`, `js/db.js`, `js/ai.js` are not needed.
 - `eglib.js` finds the app folder from its own script URL (`EGLib.base`, e.g. `https://jamalmuhoza.github.io/examgrader/`) and loads the font from `EGLib.base + 'fonts/DejaVuSans.ttf'`.
