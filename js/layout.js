@@ -199,6 +199,14 @@ const Layout = (() => {
       const cover = { page: 1, compact: true };
       cover.name = { x: CONTENT.left, y: 37.4, w: 110, h: 8 };       // writing area; the Name line is its bottom edge
       cover.score = { x: 146, y: 36.6, w: 50, h: 9.6 };
+      if (L.kind === 'homework') {
+        // homework (Nov 24 2026): one box for the typed or written student ID, beside the name; no bubbles
+        cover.idText = { x: CONTENT.left + 22, y: 49.6, w: 52, h: 9 };
+        cover.idBox = { x: CONTENT.left, y: 49.6, w: 74, h: 9 };
+        cover.id = { r: BUB_R, cols: [], flat: true, none: true };
+        cover.end = 62.4;
+        L.cover = cover; L.pages.push({ no: 1, kind: 'head' }); headEnd = cover.end + 3.4;
+      } else {
       // flat student ID: one horizontal row of bubbles 0-9 per digit, rows stacked in up to two blocks side by side
       const idTop = 52.4, rowH = 6.2, pitch = 6.0, blockW = 86;
       const per = nd <= 3 ? nd : Math.ceil(nd / 2);
@@ -215,6 +223,7 @@ const Layout = (() => {
       L.cover = cover;
       L.pages.push({ no: 1, kind: 'head' });
       headEnd = cover.end + 3.4;
+      }
     } else {
       const cover = { page: 1 };
       cover.name = { x: CONTENT.left, y: 74, w: 112, h: 14 };
@@ -253,7 +262,10 @@ const Layout = (() => {
 
     // ---- MC pages ----
     const mcs = exam.mc || [];
-    const STEM_PT = 10.5, CH_PT = 10, STEM_LH = lh(STEM_PT), CH_LH = lh(CH_PT);
+    // homework / quiz: type and rows get smaller when ten questions do not fit on their page (MS < 1)
+    const MS = compact ? (exam._mcScale || 1) : 1, RH6 = Math.max(5.2, 6.4 * MS);
+    const STEM_PT = 10.5 * MS, CH_PT = 10 * MS, STEM_LH = lh(STEM_PT), CH_LH = lh(CH_PT);
+    L.mcScale = MS;
     // homework / quiz: two columns filled column by column (a question never splits); exam: one column
     const stemX = 31, bubX = 34, chX = 39.5;
     const COLDX = 89, COL2_X0 = 108.5;
@@ -293,10 +305,10 @@ const Layout = (() => {
         const texts = Array.from({ length: nCh }, (_, i) => String((q.choices || [])[i] || ''));
         const avail = stemX + stemW - (bubX - BUB_R) + FLAT_GAP;
         const cell = FLAT_TXT + Math.max(...texts.map(t => textW(doc, t, CH_PT, uni))) + FLAT_GAP;
-        let per = Math.min(nCh, Math.floor(avail / cell));
-        if (per >= 2 && !texts.some(t => /\n/.test(t))) {
-          const nRows = Math.ceil(nCh / per); per = Math.ceil(nCh / nRows);
-          flat = { per, nRows, cw: avail / per, lines: texts.map(t => wrap(doc, t, 1000, CH_PT, 'normal', uni)) };
+        const per = Math.min(nCh, Math.floor(avail / cell));
+        // every choice on one line, or one choice per line (never two rows of side-by-side choices)
+        if (per >= nCh && !texts.some(t => /\n/.test(t))) {
+          flat = { per: nCh, nRows: 1, cw: avail / nCh, lines: texts.map(t => wrap(doc, t, 1000, CH_PT, 'normal', uni)) };
         }
       }
       for (let i = 0; i < nCh && !flat; i++) {
@@ -307,16 +319,16 @@ const Layout = (() => {
           if (cc.center || cc.base === null || cc.base === undefined) { dy = 0.6; by = Math.max(3.2, dy + h / 2); }
           else { const base = cc.base * PT * LS * k; dy = Math.max(0.3, 4.45 - base); by = Math.max(3.2, dy + base - 1.25); }
           chs.push({ img: { dy, w, h }, by, lines: [] });
-          rows.push(Math.max(6.4, dy + h + 1.6, by + BUB_R + 1));
+          rows.push(Math.max(RH6, dy + h + 1.6, by + BUB_R + 1));
         } else {
           const ci = !look && q.choiceImgs && q.choiceImgs[i] ? fitBox(q.choiceImgs[i], chW, 50) : null;
           const ctext = (q.choices || [])[i] || '';
           const ls = ci && ctext === '[picture]' ? [] : wrap(doc, ctext, chW, CH_PT, 'normal', uni);
           chs.push({ lines: ls, by: ci && !ls.length ? Math.max(3.2, 1.0 + ci.h / 2) : 3.2, cimg: ci });
-          rows.push(Math.max(6.4, ci && !ls.length ? ci.h + 2.6 : Math.max(1, ls.length) * CH_LH + 2.0 + (ci ? ci.h + 1.2 : 0)));
+          rows.push(Math.max(RH6, ci && !ls.length ? ci.h + 2.6 : Math.max(1, ls.length) * CH_LH + 1.6 * Math.max(MS, .8) + (ci ? ci.h + 1.2 : 0)));
         }
       }
-      const h = stemH + (flat ? flat.nRows * 6.4 : rows.reduce((a, b) => a + b, 0)) + 3.2;
+      const h = stemH + (flat ? flat.nRows * RH6 : rows.reduce((a, b) => a + b, 0)) + 3.2 * Math.max(MS, .8);
       if (h > CONTENT.bottom - CONTENT.top) L.issues.push(`MC ${qi + 1} is taller than a full page; shorten its text.`);
       placed.push({ h, make: (top, page, col) => {
         const ox = col * COLDX, sx = stemX + ox;
@@ -329,8 +341,8 @@ const Layout = (() => {
         if (flat) {
           item.flat = true;
           for (let i = 0; i < nCh; i++) {
-            const rt = top + stemH + Math.floor(i / flat.per) * 6.4, bx = bubX + ox + (i % flat.per) * flat.cw;
-            item.choices.push({ label: LETTERS[i], x: bx, y: rt + 3.2, text: { x: bx + (chX - bubX), y: rt + 3.2 + 1.25, lines: flat.lines[i] }, rowTop: rt, rowH: 6.4 });
+            const rt = top + stemH + Math.floor(i / flat.per) * RH6, bx = bubX + ox + (i % flat.per) * flat.cw;
+            item.choices.push({ label: LETTERS[i], x: bx, y: rt + 3.2, text: { x: bx + (chX - bubX), y: rt + 3.2 + 1.25, lines: flat.lines[i] }, rowTop: rt, rowH: RH6 });
           }
         }
         for (let i = 0; i < nCh && !flat; i++) {
@@ -345,8 +357,26 @@ const Layout = (() => {
         return item;
       } });
     });
-    // place the measured questions: one column (exam) or two columns filled column by column (homework, quiz)
+    // homework / quiz (Nov 24 2026): a fixed structure, ten multiple choice per page in two columns (first half left);
+    // a page of written questions follows, five per page
+    if (compact && !exam._mcFlow && placed.length) {
+      let mcEndC = y;
+      for (let g = 0; g < placed.length; g += 10) {
+        if (g > 0) newPage('mc');
+        const grp = placed.slice(g, g + 10), half = Math.ceil(grp.length / 2), top0 = y;
+        let yl = top0, yr = top0;
+        grp.forEach((m, i) => {
+          const colI = i < half ? 0 : 1; let t = colI ? yr : yl;
+          if (t + m.h > CONTENT.bottom) L._mcOver = true;
+          L.mc.push(m.make(t, page, colI));
+          if (colI) yr += m.h; else yl += m.h;
+        });
+        mcEndC = Math.max(yl, yr);
+      }
+      y = mcEndC;
+    }
     let col = 0, colTop = y;
+    if (!compact || exam._mcFlow) {
     const spots = placed.map(m => {
       if (y + m.h > CONTENT.bottom) {
         if (compact && col === 0 && colTop + m.h <= CONTENT.bottom) { col = 1; y = colTop; }
@@ -376,11 +406,12 @@ const Layout = (() => {
     }
     spots.forEach(sp => L.mc.push(sp.m.make(sp.top, sp.page, sp.col)));
     y = mcEnd;
+    }
 
     // ---- short-answer pages ----
     const sas = exam.sa || [];
     if (sas.length && !compact) y = CONTENT.bottom + 1;
-    else if (sas.length && mcs.length) y = mcEnd + 2;   // homework / quiz: written answers follow the questions on the same page
+    else if (sas.length && mcs.length) y = y + 2;
     const P_PT = 10.5, P_LH = lh(P_PT);
     // written questions: full width, one per row; each box exactly its lines tall (never stretched)
     const measureSA = (q, qi, wTxt) => {
@@ -406,6 +437,84 @@ const Layout = (() => {
       if (pImgs.length) { let iy = top + lines.length * P_LH + 0.4; item.prompt.imgs = pImgs.map(f => { const r = { x: sx, y: iy, w: f.w, h: f.h }; iy += f.h + 1.2; return r; }); }
       L.sa.push(item);
     };
+    if (compact) {
+      // up to five per page; a question with a picture or a long text takes more of the page; leftover room is shared by the boxes
+      const PL = lh(10.5), MINBOX = 24, GAP = 3, wTxt = CONTENT.right - stemX, uni = exam.uniText === true && !!UNI;
+      const meas = sas.map((q, qi) => {
+        if (q.kind === 'page' && q.img) return { q, qi, page: true };
+        const lines = q.prompt && q.prompt.trim() && !q.img ? wrap(doc, q.prompt, wTxt, P_PT, 'normal', uni) : (q.img ? [] : ['']);
+        const pImgs = [q.img, ...(q.imgs || [])].filter(Boolean).map(im => fitBox(im, wTxt, 80));
+        const promptH = (lines.length ? lines.length * PL : 0) + pImgs.reduce((a, f) => a + f.h + 1.2, 0) + 1.6;
+        // boxes with printed rows need room for about 7 mm per writing line
+        const LWm = CONTENT.right - stemX - 24;
+        const slots = (q.fill || []).filter(r => r && typeof r.t === 'string').reduce((a, r) => a + Math.max(1, r.t ? wrap(doc, r.t, LWm * 0.7, 9.5, 'bold', uni).length : 1) + Math.max(1, Math.min(4, r.lines | 0 || 1)) - 1, 0);
+        const minBox = Math.max(MINBOX, slots ? 3 + slots * 6.4 : 0);
+        return { q, qi, lines, pImgs, promptH, minBox, need: promptH + minBox + GAP };
+      });
+      const groups = []; let cur = null, avail0 = 0;
+      // when the multiple choice ran onto a second page, the written questions start under it on that page (saves a page)
+      const mcPages = new Set(L.mc.map(m => m.page)).size, shareTop = mcs.length && mcPages > 1 && y + 60 < CONTENT.bottom ? y + 5 : null;
+      const startPage = (first) => { const share = first && shareTop !== null, top = first && !mcs.length ? headEnd : share ? shareTop : CONTENT.top; cur = { top, avail: CONTENT.bottom - top, used: 0, items: [], first, share }; groups.push(cur); };
+      meas.forEach((m, k) => {
+        if (m.page) { cur = null; groups.push({ pageItem: m }); return; }
+        if (!cur || cur.items.length >= 5 || cur.used + m.need > cur.avail + 1e-6) {
+          startPage(groups.length === 0);
+          if (cur.share && m.need > cur.avail) { groups.pop(); cur = { top: CONTENT.top, avail: CONTENT.bottom - CONTENT.top, used: 0, items: [], first: false }; groups.push(cur); }
+        }
+        cur.items.push(m); cur.used += m.need;
+      });
+      groups.forEach((g, gi) => {
+        if (g.pageItem) {
+          const q = g.pageItem.q, qi = g.pageItem.qi;
+          newPage('wpage');
+          const f = fitBox(q.img, CONTENT.right - CONTENT.left, 238 - CONTENT.top);
+          const box = { x: CONTENT.left + (CONTENT.right - CONTENT.left - f.w) / 2, y: CONTENT.top, w: f.w, h: f.h }, bot = box.y + box.h;
+          L.sa.push({ qid: q.id, num: mcs.length + qi + 1, label: 'SA' + (qi + 1), page, max: +q.max || 0, top: CONTENT.top, kind: 'page', prompt: { x: stemX, y: CONTENT.top, lines: [] }, box, img: box,
+            scoreBox: { x: 181.5, y: bot + 1.5, w: 14.5, h: 12 }, comment: { x: CONTENT.left, y: bot + 1.5, w: 150, h: 8 }, region: { x: 11.5, y: CONTENT.top - 1.5, w: 196 - 11.5 + 2, h: bot + 17 - CONTENT.top } });
+          return;
+        }
+        if (!(g.first && (!mcs.length || g.share))) newPage('sa');
+        if (g.used > g.avail + 1e-6) L.issues.push(`Short answer ${g.items[0].qi + 1} is taller than a page; shorten it or its picture.`);
+        const extra = Math.max(0, (g.avail - g.used) / g.items.length);
+        let top = g.top;
+        g.items.forEach(m => {
+        const { q, qi, lines, pImgs, promptH } = m;
+        const boxH = m.minBox + extra, SLOTH = m.need + extra;
+        const box = { x: stemX, y: top + promptH, w: CONTENT.right - stemX, h: boxH };
+        const item = { qid: q.id, num: mcs.length + qi + 1, label: 'SA' + (qi + 1), page, max: +q.max || 0, top, uni,
+          prompt: { x: stemX, y: top, lines }, box, inner: true,
+          scoreBox: { x: box.x + box.w - 17, y: box.y + 1.4, w: 15.6, h: 10 },
+          comment: { x: box.x + 2, y: box.y + box.h - 9, w: box.w - 21, h: 8 },
+          region: { x: 11.5, y: top - 1.5, w: 196 - 11.5 + 2, h: SLOTH - 0.5 } };
+        if (pImgs.length) { let iy = top + lines.length * PL + 0.4; item.prompt.imgs = pImgs.map(f => { const r = { x: stemX, y: iy, w: f.w, h: f.h }; iy += f.h + 1.2; return r; }); }
+        top += SLOTH;
+        // rows printed in the box: the item the student answers about, then writing lines
+        const F = (q.fill || []).filter(r => r && typeof r.t === 'string');
+        if (F.length) {
+          // a long label wraps (never cut): its last line carries the first writing line
+          const LW = box.w - 24;
+          const R = F.map(r => { const lbl = r.t ? wrap(doc, r.t, LW * 0.7, 9.5, 'bold', uni) : []; const n = Math.max(1, Math.min(4, r.lines | 0 || 1)); return { r, lbl, n, slots: Math.max(1, lbl.length) + n - 1 }; });
+          const nL = R.reduce((a, x) => a + x.slots, 0);
+          const pitch = Math.min(9.5, (box.h - 3) / nL);
+          let ry = box.y + 1.5;
+          item.fill = R.map((x, i) => {
+            const m = Math.max(1, x.lbl.length), LL = x.lbl[x.lbl.length - 1];
+            let lastW = 0; if (LL) { if (typeof LL === 'string') { setF(doc, 'bold', uni); doc.setFontSize(9.5); lastW = doc.getTextWidth(LL); } else lastW = (LL.runs || []).reduce((a, r) => a + runW(doc, r, 9.5), 0) * 1.06; }
+            const ln = [];
+            for (let k = m - 1; k < x.slots; k++) {
+              const by = ry + pitch * (k + 1) - 1.4;
+              const x0 = k === m - 1 && x.lbl.length ? box.x + 3 + lastW + 2 : box.x + 3;
+              const x1 = (by < item.scoreBox.y + item.scoreBox.h + 1) ? item.scoreBox.x - 2 : box.x + box.w - 3;
+              ln.push({ x0, x1, y: by });
+            }
+            const row = { t: x.lbl.length ? 1 : '', tl: x.lbl, k: x.r.k || '', x: box.x + 3, y: ry + pitch - 2.6, pitch, h: x.slots * pitch, lines: ln };
+            ry += x.slots * pitch; return row;
+          });
+        }
+        L.sa.push(item);
+        });
+      });
+    } else
     for (let qi = 0; qi < sas.length; qi++) {
       const q = sas[qi];
       if (q.kind === 'page' && q.img) {
@@ -437,6 +546,12 @@ const Layout = (() => {
       const f = fitBox(rp.img, CONTENT.right - CONTENT.left, CONTENT.bottom - CONTENT.top);
       L.extra.push({ id: rp.id, page, kind: 'ref', img: { x: CONTENT.left + (CONTENT.right - CONTENT.left - f.w) / 2, y: CONTENT.top, w: f.w, h: f.h } });
     });
+    if (L._mcOver) {
+      // smaller type down to about 9 pt; past that the questions flow onto the next page instead
+      if (MS > 0.81) return compute(Object.assign({}, exam, { _mcScale: Math.round((MS - 0.05) * 100) / 100 }));
+      return compute(Object.assign({}, exam, { _mcScale: 1, _mcFlow: true }));
+    }
+    delete L._mcOver;
     L.pageCount = page;
     // preflight checks
     preflight(L);
@@ -524,15 +639,16 @@ const Layout = (() => {
       const pic = (im, r, alias) => { if (im && im.src && r) { try { doc.addImage(im.src, imgFmt(im.src), r.x, r.y, r.w, r.h, alias); } catch (e) { console.error('image', alias, e); } } };
       L.mc.filter(q => q.page === p).forEach(q => {
         const src = mcById[q.qid] || {};
-        doc.setFont('helvetica', 'bold'); doc.setFontSize(10.5); doc.setTextColor(20);
-        doc.text((q.label || q.num) + '.', q.numX || 29.5, q.stem.numY || q.stem.y + 3.7, { align: 'right' });
+        const ms = L.mcScale || 1;
+        doc.setFont('helvetica', 'bold'); doc.setFontSize(10.5 * ms); doc.setTextColor(20);
+        doc.text((q.label || q.num) + '.', q.numX || 29.5, q.stem.numY || q.stem.y + 3.7 * ms, { align: 'right' });
         if (q.stem.img) pic(src.look && src.look.stem, q.stem.img, q.qid + ':s');
-        else textLines(doc, q.stem.lines, q.stem.x, q.stem.y + 3.7, 10.5, 'normal', lh(10.5), 20, q.uni);
+        else textLines(doc, q.stem.lines, q.stem.x, q.stem.y + 3.7 * ms, 10.5 * ms, 'normal', lh(10.5 * ms), 20, q.uni);
         (q.stem.imgs || []).forEach((r, k) => pic((src.imgs || [])[k], r, q.qid + ':si' + k));
         q.choices.forEach((c, k) => {
           bubble(doc, c.x, c.y, q.r, c.label, key && correct[q.qid] === c.label);
           if (c.img) pic(src.look && src.look.choices[k], c.img, q.qid + ':c' + k);
-          else textLines(doc, c.text.lines, c.text.x, c.text.y, 10, 'normal', lh(10), 30, q.uni);
+          else textLines(doc, c.text.lines, c.text.x, c.text.y, 10 * ms, 'normal', lh(10 * ms), 30, q.uni);
           if (c.cimg) pic((src.choiceImgs || [])[k], c.cimg, q.qid + ':ci' + k);
         });
       });
@@ -562,6 +678,37 @@ const Layout = (() => {
         doc.setDrawColor(60); doc.setLineWidth(0.3);
         doc.rect(s.box.x, s.box.y, s.box.w, s.box.h, 'S');
         const sb = s.scoreBox;
+        if (s.inner) {
+          // points box inside the answer box (top right): "pts" and "/ max"
+          doc.setDrawColor(130); doc.setLineWidth(0.22); doc.rect(sb.x, sb.y, sb.w, sb.h, 'S');
+          doc.setFontSize(6.5); doc.setTextColor(110); doc.text('pts', sb.x + 1.2, sb.y + 2.6);
+          doc.setFontSize(8); doc.setTextColor(70); doc.text('/ ' + U.fmt(s.max), sb.x + sb.w - 1.2, sb.y + sb.h - 1.4, { align: 'right' });
+          (s.fill || []).forEach(r => {
+            if (r.t) { doc.setFont('helvetica', 'bold'); doc.setFontSize(9.5); doc.setTextColor(30); (r.tl || [r.t]).forEach((t, k) => textLines(doc, [t], r.x, r.y + k * (r.pitch || lh(9.5)), 9.5, 'bold', lh(9.5), 30, s.uni)); }
+            doc.setDrawColor(175); doc.setLineWidth(0.2);
+            r.lines.forEach(l => doc.line(l.x0, l.y, l.x1, l.y));
+            if (key && r.k) {
+              doc.setFont('helvetica', 'normal'); doc.setTextColor(0, 85, 58); doc.setFontSize(9);
+              const l0 = r.lines[0], ku = needsUni(r.k);
+              const kl = wrap(doc, r.k, Math.max(20, l0.x1 - l0.x0 - 1), 9, 'normal', ku).slice(0, r.lines.length);
+              kl.forEach((t, i) => { const L1 = r.lines[i]; textLines(doc, [t], L1.x0 + 0.5, L1.y - 1.2, 9, 'normal', lh(9), 60, ku); });
+            }
+          });
+          if (key && q.key && !(s.fill || []).some(r => r.k)) {
+            doc.setTextColor(0, 85, 58); doc.setFontSize(9.5);
+            const ku = needsUni(q.key);
+            let kl = wrap(doc, 'Key: ' + q.key, s.box.w - 24, 9.5, 'normal', ku);
+            const room = Math.max(1, Math.floor((s.box.h - 4) / lh(9.5))); if (kl.length > room) kl = kl.slice(0, room);
+            textLines(doc, kl, s.box.x + 3, s.box.y + 5, 9.5, 'normal', lh(9.5), 60, ku);
+          }
+          if (key && (q.keyImgs || []).length && !(s.fill || []).length) {
+            let iy = s.box.y + 6 + (q.key ? Math.min(3, wrap(doc, 'Key: ' + q.key, s.box.w - 24, 9.5).length) * lh(9.5) : 0);
+            q.keyImgs.forEach((im, k) => { const maxH = s.box.y + s.box.h - 1.5 - iy; if (maxH < 8) return;
+              const sc = Math.min(1, (s.box.w - 24) / (im.wpt * PT), maxH / (im.hpt * PT)), w = im.wpt * PT * sc, h = im.hpt * PT * sc;
+              pic(im, { x: s.box.x + 3, y: iy, w, h }, s.qid + ':k' + k); iy += h + 1; });
+          }
+          return;
+        }
         doc.setDrawColor(130); doc.setLineWidth(0.22);
         doc.rect(sb.x, sb.y, sb.w, sb.h, 'S');
         doc.setFontSize(6.5);
@@ -684,6 +831,15 @@ const Layout = (() => {
     doc.text('Score', sb.x + 2, sb.y + 6.4);
     doc.setLineWidth(0.25); doc.line(sb.x + 15, sb.y + 7.2, sb.x + 31, sb.y + 7.2);
     doc.setFont('helvetica', 'normal'); doc.text('/ ' + U.fmt(total), sb.x + 32.5, sb.y + 6.4);
+    if (C.idText) {
+      // homework: Student ID box (typed online, or written on paper)
+      const T = C.idText;
+      doc.setTextColor(30); doc.setFont('helvetica', 'bold'); doc.setFontSize(10);
+      doc.text('Student ID', C.idBox.x, T.y + T.h - 2.4);
+      doc.setDrawColor(60); doc.setLineWidth(0.35); doc.rect(T.x, T.y, T.w, T.h, 'S');
+      doc.setDrawColor(190); doc.setLineWidth(0.25); doc.line(CONTENT.left, C.end, CONTENT.right, C.end);
+      return;
+    }
     // student ID: one row of bubbles per digit
     const B = C.idBox;
     doc.setTextColor(30); doc.setFont('helvetica', 'bold'); doc.setFontSize(9.5);

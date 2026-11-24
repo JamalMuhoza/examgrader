@@ -442,7 +442,7 @@ const CV = (() => {
         const cl = classify(ds, col.bubbles.map(b => String(b.d)), th);
         return { ...cl, ds: ds.map(v => Math.round(v * 1000) / 1000) };
       });
-      const ok = digits.every(d => d.status === 'single');
+      const ok = digits.length > 0 && digits.every(d => d.status === 'single');
       res.id = { digits, value: digits.map(d => d.status === 'single' ? d.choice : '?').join(''), ok };
     }
     return res;
