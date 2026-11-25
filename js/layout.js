@@ -317,7 +317,7 @@ const Layout = (() => {
       const rows = [], chs = [];
       // homework / quiz: short one-line choices side by side (A B C / D E), each bubble beside its choice
       let flat = null;
-      if (compact && !look && !(q.choiceImgs || []).some(Boolean)) {
+      if (false && compact && !look && !(q.choiceImgs || []).some(Boolean)) {   // Nov 25 2026: choices always one per line (no side-by-side choices)
         const texts = Array.from({ length: nCh }, (_, i) => String((q.choices || [])[i] || ''));
         const avail = stemX + stemW - (bubX - BUB_R) + FLAT_GAP;
         const cell = FLAT_TXT + Math.max(...texts.map(t => textW(doc, t, CH_PT, uni))) + FLAT_GAP;
@@ -478,8 +478,8 @@ const Layout = (() => {
         const promptH = (lines.length ? lines.length * PL : 0) + pImgs.reduce((a, f) => a + f.h + 1.2, 0) + 1.6;
         // boxes with printed rows need room for about 7 mm per writing line
         const LWm = CONTENT.right - stemX - 24;
-        const slots = (q.fill || []).filter(r => r && typeof r.t === 'string').reduce((a, r) => a + Math.max(1, r.t ? wrap(doc, r.t, LWm * 0.7, 9.5, 'bold', uni).length : 1) + (minB <= 10 ? 0 : Math.max(1, Math.min(4, r.lines | 0 || 1)) - 1), 0);
-        const minBox = Math.max(minB, slots ? 3 + slots * (minB <= 10 ? 6.0 : minB <= 12 ? 4.8 : minB < MINBOX ? 5.4 : 6.4) : 0);
+        const slots = (q.fillCols === 2 && (q.fill || []).length >= 4 ? 0.5 : 1) * (q.fill || []).filter(r => r && typeof r.t === 'string').reduce((a, r) => a + Math.max(1, r.t ? wrap(doc, r.t, LWm * 0.7, 9.5, 'bold', uni).length : 1) + (minB <= 10 ? 0 : Math.max(1, Math.min(4, r.lines | 0 || 1)) - 1), 0);
+        const sz = Math.max(1, Math.min(3, +q.size || 2)), minBox = Math.max(minB * (sz === 3 ? 1.5 : sz === 1 ? 0.8 : 1), slots ? 3 + slots * (minB <= 10 ? 6.0 : minB <= 12 ? 4.8 : minB < MINBOX ? 5.4 : 6.4) : 0);
         return { q, qi, lines, pImgs, promptH, minBox, need: promptH + minBox + GAP };
       };
       // groups of five (a whole-page question stands alone); in each group pictures, then the empty room, shrink until all five fit on the page
@@ -487,20 +487,25 @@ const Layout = (() => {
       const flush = () => {
         if (!run.length) return;
         let pick = null, fits = false;
-        for (const [picH, minB] of [[80, MINBOX], [60, MINBOX], [45, MINBOX], [34, MINBOX], [26, 20], [20, 16], [18, 12], [16, 10]]) {
-          const mm = run.map(([q, qi]) => measure(q, qi, picH, minB));
-          const room = !meas.length && !mcs.length ? CONTENT.bottom - headEnd : CONTENT.bottom - CONTENT.top;
-          pick = mm; if (mm.reduce((a, m) => a + m.need, 0) <= room + 1e-6) { fits = true; break; }
+        const CFGS = [[80, MINBOX], [60, MINBOX], [45, 20], [38, 20], [38, 17]], SPLIT = [38, 20];
+        const room = !meas.length && !mcs.length ? CONTENT.bottom - headEnd : CONTENT.bottom - CONTENT.top;
+        const fit = (r, c) => { const mm = r.map(([q, qi]) => measure(q, qi, c[0], c[1])); return mm.reduce((a, m) => a + m.need, 0) <= room + 1e-6 ? mm : null; };
+        for (const c of CFGS) { const mm = fit(run, c); pick = mm || pick; if (mm) { fits = true; break; } }
+        // five cannot fit with boxes big enough to work in (a long list question, a full calculation): this page takes as many as fit,
+        // the rest move on to the next page with the questions after them (Nov 25 2026: boxes stay adequate)
+        let rest = [];
+        if (!fits && run.length > 1) {
+          const last = SPLIT; let k = run.length - 1; while (k > 1 && !fit(run.slice(0, k), last)) k--;
+          rest = run.slice(k); run = run.slice(0, k); pick = fit(run, last) || run.map(([q, qi]) => measure(q, qi, last[0], last[1]));
+          for (const c of CFGS) { const mm = fit(run, c); if (mm) { pick = mm; break; } }
         }
-        // five cannot fit even with small pictures (a long list question, a full drawing task): that page takes fewer
-        if (!fits && run.length > 1) { const all = run, cut = Math.ceil(all.length / 2); run = all.slice(0, cut); flush(); run = all.slice(cut); flush(); return; }
-        pick.forEach(m => { m.grp = meas.length; }); const gid = meas.length; meas.push(...pick.map(m => Object.assign(m, { gid }))); run = [];
+        pick.forEach(m => { m.grp = meas.length; }); const gid = meas.length; meas.push(...pick.map(m => Object.assign(m, { gid }))); run = rest;
       };
       sas.forEach((q, qi) => {
-        if (q.kind === 'page' && q.img) { flush(); meas.push({ q, qi, page: true }); return; }
+        if (q.kind === 'page' && q.img) { while (run.length) flush(); meas.push({ q, qi, page: true }); return; }
         run.push([q, qi]); if (run.length === 5) flush();
       });
-      flush();
+      while (run.length) flush();
       const groups = []; let cur = null, avail0 = 0;
       // when the multiple choice ran onto a second page, the written questions start under it on that page (saves a page)
       const shareTop = null;   // Nov 25 2026: the written questions always start on their own page
@@ -525,11 +530,11 @@ const Layout = (() => {
         }
         if (!(g.first && (!mcs.length || g.share))) newPage('sa');
         if (g.used > g.avail + 1e-6) L.issues.push(`Short answer ${g.items[0].qi + 1} is taller than a page; shorten it or its picture.`);
-        const extra = Math.max(0, (g.avail - g.used) / g.items.length);
+        const wsum = g.items.reduce((a, m) => a + Math.max(1, Math.min(3, +m.q.size || 2)), 0), spare = Math.max(0, g.avail - g.used);   // leftover room shared by size (1 short, 2 a few sentences, 3 calculation or drawing)
         let top = g.top;
         g.items.forEach(m => {
         const { q, qi, lines, pImgs, promptH } = m;
-        const boxH = m.minBox + extra, SLOTH = m.need + extra;
+        const extra = spare * Math.max(1, Math.min(3, +q.size || 2)) / wsum, boxH = m.minBox + extra, SLOTH = m.need + extra;
         const box = { x: stemX, y: top + promptH, w: CONTENT.right - stemX, h: boxH };
         const item = { qid: q.id, num: mcs.length + qi + 1, label: 'SA' + (qi + 1), page, max: +q.max || 0, top, uni,
           prompt: { x: stemX, y: top, lines }, box, inner: true,
@@ -541,26 +546,31 @@ const Layout = (() => {
         // rows printed in the box: the item the student answers about, then writing lines
         const F = (q.fill || []).filter(r => r && typeof r.t === 'string');
         if (F.length) {
-          // a long label wraps (never cut): its last line carries the first writing line
-          const LW = box.w - 24;
-          const R = F.map(r => { const lbl = r.t ? wrap(doc, r.t, LW * 0.7, 9.5, 'bold', uni) : []; const n = Math.max(1, Math.min(4, r.lines | 0 || 1)); return { r, lbl, n, slots: Math.max(1, lbl.length) + n - 1 }; });
+          // a long label wraps (never cut): its last line carries the first writing line.
+          // q.fillCols = 2 (long lists of short items, for example "draw a compound for each group"): the rows go in two columns.
+          const NC = q.fillCols === 2 && F.length >= 4 ? 2 : 1, CW = (box.w - (NC - 1) * 4) / NC;
+          const LW = CW - 24;
+          const R = F.map(r => { const lbl = r.t ? wrap(doc, r.t, LW * 0.8, 9.5, 'bold', uni) : []; const n = Math.max(1, Math.min(4, r.lines | 0 || 1)); return { r, lbl, n, slots: Math.max(1, lbl.length) + n - 1 }; });
+          const half = NC === 2 ? Math.ceil(R.length / 2) : R.length, colOf = i => i < half ? 0 : 1;
+          const tall = () => Math.max(...[0, 1].map(c => R.filter((x, i) => colOf(i) === c).reduce((a, x) => a + x.slots, 0)));
           // a crowded page: fewer writing lines per row before the lines get too close to write on (at least about 5.6 mm apart)
-          let nL = R.reduce((a, x) => a + x.slots, 0);
-          while ((box.h - 3) / nL < 5.6) { const x = R.filter(x => x.n > 1).sort((a, b) => b.n - a.n)[0]; if (!x) break; x.n--; x.slots--; nL--; }
+          let nL = tall();
+          while ((box.h - 3) / nL < 5.6) { const x = R.filter(x => x.n > 1).sort((a, b) => b.n - a.n)[0]; if (!x) break; x.n--; x.slots--; nL = tall(); }
           const pitch = Math.min(9.5, (box.h - 3) / nL);
-          let ry = box.y + 1.5;
+          const ry0 = box.y + 1.5, RY = [ry0, ry0];
           item.fill = R.map((x, i) => {
+            const c = colOf(i), cx = box.x + c * (CW + 4); let ry = RY[c];
             const m = Math.max(1, x.lbl.length), LL = x.lbl[x.lbl.length - 1];
             let lastW = 0; if (LL) { if (typeof LL === 'string') { setF(doc, 'bold', uni); doc.setFontSize(9.5); lastW = doc.getTextWidth(LL); } else lastW = (LL.runs || []).reduce((a, r) => a + runW(doc, r, 9.5), 0) * 1.06; }
             const ln = [];
             for (let k = m - 1; k < x.slots; k++) {
               const by = ry + pitch * (k + 1) - 1.4;
-              const x0 = k === m - 1 && x.lbl.length ? box.x + 3 + lastW + 2 : box.x + 3;
-              const x1 = (by < item.scoreBox.y + item.scoreBox.h + 1) ? item.scoreBox.x - 2 : box.x + box.w - 3;
+              const x0 = k === m - 1 && x.lbl.length ? cx + 3 + lastW + 2 : cx + 3;
+              const x1 = cx + CW - 3;
               ln.push({ x0, x1, y: by });
             }
-            const row = { t: x.lbl.length ? 1 : '', tl: x.lbl, k: x.r.k || '', x: box.x + 3, y: ry + pitch - 2.6, pitch, h: x.slots * pitch, lines: ln };
-            ry += x.slots * pitch; return row;
+            const row = { t: x.lbl.length ? 1 : '', tl: x.lbl, k: x.r.k || '', x: cx + 3, y: ry + pitch - 2.6, pitch, h: x.slots * pitch, lines: ln };
+            RY[c] = ry + x.slots * pitch; return row;
           });
         }
         L.sa.push(item);
@@ -732,9 +742,7 @@ const Layout = (() => {
         const sb = s.scoreBox;
         if (s.inner) {
           // points box inside the answer box (top right): "pts" and "/ max"
-          doc.setDrawColor(130); doc.setLineWidth(0.22); doc.rect(sb.x, sb.y, sb.w, sb.h, 'S');
-          doc.setFontSize(6.5); doc.setTextColor(110); doc.text('pts', sb.x + 1.2, sb.y + 2.6);
-          doc.setFontSize(8); doc.setTextColor(70); doc.text('/ ' + U.fmt(s.max), sb.x + sb.w - 1.2, sb.y + sb.h - 1.4, { align: 'right' });
+          // Nov 25 2026: no points box printed for students; the teacher's marked copy writes the points in this corner
           (s.fill || []).forEach(r => {
             if (r.t) { doc.setFont('helvetica', 'bold'); doc.setFontSize(9.5); doc.setTextColor(30); (r.tl || [r.t]).forEach((t, k) => textLines(doc, [t], r.x, r.y + k * (r.pitch || lh(9.5)), 9.5, 'bold', lh(9.5), 30, s.uni)); }
             doc.setDrawColor(175); doc.setLineWidth(0.2);
@@ -891,7 +899,6 @@ const Layout = (() => {
       doc.setDrawColor(60); doc.setLineWidth(0.35);
       if (C.idCells) C.idCells.forEach(c => doc.rect(c.x, c.y, c.w, c.h, 'S')); else doc.rect(T.x, T.y, T.w, T.h, 'S');
       doc.setFont('helvetica', 'normal'); doc.setFontSize(8); doc.setTextColor(110);
-      if (C.idCells) doc.text('One digit per box', T.x + T.w + 3, T.y + T.h - 2.6);
       doc.setDrawColor(190); doc.setLineWidth(0.25); doc.line(CONTENT.left, C.end, CONTENT.right, C.end);
       return;
     }
