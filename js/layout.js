@@ -487,12 +487,12 @@ const Layout = (() => {
       const flush = () => {
         if (!run.length) return;
         let pick = null, fits = false;
-        const CFGS = [[80, MINBOX], [60, MINBOX], [45, 20], [38, 20], [38, 17]], SPLIT = [38, 20];
+        const CFGS = [[80, MINBOX], [60, MINBOX], [45, 20], [38, 20], [38, 17], [34, 15], [30, 13], [28, 11], [26, 9]], SPLIT = [26, 9];
         const room = !meas.length && !mcs.length ? CONTENT.bottom - headEnd : CONTENT.bottom - CONTENT.top;
         const fit = (r, c) => { const mm = r.map(([q, qi]) => measure(q, qi, c[0], c[1])); return mm.reduce((a, m) => a + m.need, 0) <= room + 1e-6 ? mm : null; };
         for (const c of CFGS) { const mm = fit(run, c); pick = mm || pick; if (mm) { fits = true; break; } }
-        // five cannot fit with boxes big enough to work in (a long list question, a full calculation): this page takes as many as fit,
-        // the rest move on to the next page with the questions after them (Nov 25 2026: boxes stay adequate)
+        // his rule (Nov 25 2026): five written questions per page, no exception; boxes shrink step by step until five fit, and the spare room
+        // is then shared out by how much work each question needs. Only a page that cannot hold five even at the smallest sizes takes fewer
         let rest = [];
         if (!fits && run.length > 1) {
           const last = SPLIT; let k = run.length - 1; while (k > 1 && !fit(run.slice(0, k), last)) k--;
