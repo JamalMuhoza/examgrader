@@ -182,7 +182,19 @@ const Layout = (() => {
   }
 
   // ---------- layout computation ----------
+  // homework / quiz (Nov 25 2026): ten multiple choice on page 1, no exception. Try two columns with smaller and smaller type, then one
+  // full-width column (choices side by side), then smaller pictures; the first arrangement that fits is used.
   function compute(exam) {
+    const L0 = compute0(exam);
+    if (!L0._over || !isCompact(exam) || exam._mcScale) { delete L0._over; return L0; }
+    const cfg = [];
+    [0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65].forEach(m => cfg.push({ _mcScale: m }));
+    [1, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65].forEach(m => cfg.push({ _wide: true, _mcScale: m }));
+    [0.85, 0.7, 0.55, 0.45, 0.35, 0.28, 0.22, 0.17].forEach(k => { cfg.push({ _mcScale: 0.65, _picK: k }); cfg.push({ _wide: true, _mcScale: 0.65, _picK: k }); });
+    for (const c of cfg) { const L = compute0(Object.assign({}, exam, c)); if (!L._over) { delete L._over; L.hash = L0.hash; return L; } }
+    delete L0._over; return L0;
+  }
+  function compute0(exam) {
     const { jsPDF } = window.jspdf;
     const doc = new jsPDF({ unit: 'mm', format: 'letter' });
     const L = {
@@ -199,10 +211,12 @@ const Layout = (() => {
       const cover = { page: 1, compact: true };
       cover.name = { x: CONTENT.left, y: 37.4, w: 110, h: 8 };       // writing area; the Name line is its bottom edge
       cover.score = { x: 146, y: 36.6, w: 50, h: 9.6 };
-      if (L.kind === 'homework') {
-        // homework (Nov 24 2026): one box for the typed or written student ID, beside the name; no bubbles
-        cover.idText = { x: CONTENT.left + 22, y: 49.6, w: 52, h: 9 };
-        cover.idBox = { x: CONTENT.left, y: 49.6, w: 74, h: 9 };
+      if (L.kind === 'homework' || L.kind === 'quiz') {
+        // homework and quiz (Nov 25 2026): the student ID in single-digit boxes beside the label (typed online, or one digit per box on paper); no bubbles
+        const ND = Math.max(4, Math.min(10, exam.idDigits | 0 || 6)), CW = 7.6, CX = CONTENT.left + 22;
+        cover.idCells = Array.from({ length: ND }, (_, i) => ({ x: CX + i * CW, y: 49.6, w: CW, h: 9.4 }));
+        cover.idText = { x: CX, y: 49.6, w: ND * CW, h: 9.4 };
+        cover.idBox = { x: CONTENT.left, y: 49.6, w: 22 + ND * CW, h: 9.4 };
         cover.id = { r: BUB_R, cols: [], flat: true, none: true };
         cover.end = 62.4;
         L.cover = cover; L.pages.push({ no: 1, kind: 'head' }); headEnd = cover.end + 3.4;
@@ -263,21 +277,23 @@ const Layout = (() => {
     // ---- MC pages ----
     const mcs = exam.mc || [];
     // homework / quiz: type and rows get smaller when ten questions do not fit on their page (MS < 1)
-    const MS = compact ? (exam._mcScale || 1) : 1, RH6 = Math.max(5.2, 6.4 * MS);
+    const MS = compact ? (exam._mcScale || 1) : 1, RH6 = Math.max(MS < 0.8 ? 4.6 : 4.7, 6.4 * MS), MR = compact && MS < 0.8 ? 2.0 : BUB_R;   // small type: slightly smaller bubbles
     const STEM_PT = 10.5 * MS, CH_PT = 10 * MS, STEM_LH = lh(STEM_PT), CH_LH = lh(CH_PT);
     L.mcScale = MS;
     // homework / quiz: two columns filled column by column (a question never splits); exam: one column
     const stemX = 31, bubX = 34, chX = 39.5;
     const COLDX = 89, COL2_X0 = 108.5;
     const FLAT_TXT = BUB_R + (chX - bubX), FLAT_GAP = 5.2;  // side-by-side choices: bubble edge to text, text end to the next bubble edge (room for marks)                     // column 2 offset; left edge of column 2's mark lane
-    const stemW = compact ? 76 : CONTENT.right - stemX, chW = stemW - (chX - stemX);
+    const WIDE = compact && !!exam._wide;   // ten questions that do not fit in two columns: one full-width column, choices side by side on one line
+    const stemW = compact && !WIDE ? 76 : CONTENT.right - stemX, chW = stemW - (chX - stemX);
     // original look: one scale for every cut-out so the type size stays even (shrunk only when the widest piece needs it)
     const lookOn = q => exam.keepLook !== false && q.look && !q.useText && (q.look.stem || (q.look.choices || []).some(Boolean));
     let maxS = 0, maxC = 0;
     mcs.filter(lookOn).forEach(q => { if (q.look.stem) maxS = Math.max(maxS, q.look.stem.wpt * PT); (q.look.choices || []).forEach(c => { if (c) maxC = Math.max(maxC, c.wpt * PT); }); });
     const LS = Math.min(1, maxS ? stemW / maxS : 1, maxC ? chW / maxC : 1);
     L.lookScale = LS;
-    const imgsH = (imgs, w) => (imgs || []).filter(Boolean).reduce((a, im) => a + fitBox(im, w, 70).h + 1.2, 0);
+    const PK = compact ? (exam._picK || 1) : 1;   // homework / quiz: pictures shrink with the type when ten questions need it
+    const imgsH = (imgs, w) => (imgs || []).filter(Boolean).reduce((a, im) => a + fitBox(im, w, 70 * PK).h + 1.2, 0);
     const placed = [];
     mcs.forEach((q, qi) => {
       const look = lookOn(q);
@@ -296,7 +312,7 @@ const Layout = (() => {
         stemLines = q.stem && q.stem.trim() ? wrap(doc, q.stem, stemW, STEM_PT, 'normal', uni) : [];
         stemH = Math.max(1, stemLines.length) * STEM_LH + 1.4;
       }
-      const sImgs = (!look ? (q.imgs || []) : []).filter(Boolean).map(im => fitBox(im, stemW, 70));
+      const sImgs = (!look ? (q.imgs || []) : []).filter(Boolean).map(im => fitBox(im, stemW, 70 * PK));
       stemH += sImgs.reduce((a, f) => a + f.h + 1.2, 0);
       const rows = [], chs = [];
       // homework / quiz: short one-line choices side by side (A B C / D E), each bubble beside its choice
@@ -309,6 +325,14 @@ const Layout = (() => {
         // every choice on one line, or one choice per line (never two rows of side-by-side choices)
         if (per >= nCh && !texts.some(t => /\n/.test(t))) {
           flat = { per: nCh, nRows: 1, cw: avail / nCh, lines: texts.map(t => wrap(doc, t, 1000, CH_PT, 'normal', uni)) };
+          flat.xs = texts.map((t, i) => i * flat.cw);
+        } else if (!texts.some(t => /\n/.test(t))) {
+          // Nov 25 2026: choices of different lengths still go on one line when their real widths fit (gaps shared out evenly)
+          const ws = texts.map(t => FLAT_TXT + textW(doc, t, CH_PT, uni)), tot = ws.reduce((a, b) => a + b, 0), gap = (avail - tot) / nCh;
+          if (gap >= 2.6) {
+            const g = Math.min(gap, 9); let acc = 0;
+            flat = { per: nCh, nRows: 1, cw: 0, xs: ws.map(w => { const x0 = acc; acc += w + g; return x0; }), lines: texts.map(t => wrap(doc, t, 1000, CH_PT, 'normal', uni)) };
+          }
         }
       }
       for (let i = 0; i < nCh && !flat; i++) {
@@ -321,18 +345,18 @@ const Layout = (() => {
           chs.push({ img: { dy, w, h }, by, lines: [] });
           rows.push(Math.max(RH6, dy + h + 1.6, by + BUB_R + 1));
         } else {
-          const ci = !look && q.choiceImgs && q.choiceImgs[i] ? fitBox(q.choiceImgs[i], chW, 50) : null;
+          const ci = !look && q.choiceImgs && q.choiceImgs[i] ? fitBox(q.choiceImgs[i], chW, 50 * PK) : null;
           const ctext = (q.choices || [])[i] || '';
           const ls = ci && ctext === '[picture]' ? [] : wrap(doc, ctext, chW, CH_PT, 'normal', uni);
           chs.push({ lines: ls, by: ci && !ls.length ? Math.max(3.2, 1.0 + ci.h / 2) : 3.2, cimg: ci });
           rows.push(Math.max(RH6, ci && !ls.length ? ci.h + 2.6 : Math.max(1, ls.length) * CH_LH + 1.6 * Math.max(MS, .8) + (ci ? ci.h + 1.2 : 0)));
         }
       }
-      const h = stemH + (flat ? flat.nRows * RH6 : rows.reduce((a, b) => a + b, 0)) + 3.2 * Math.max(MS, .8);
+      const h = stemH + (flat ? flat.nRows * RH6 : rows.reduce((a, b) => a + b, 0)) + (MS < 0.8 ? 2.0 : 3.2 * Math.max(MS, .8));
       if (h > CONTENT.bottom - CONTENT.top) L.issues.push(`MC ${qi + 1} is taller than a full page; shorten its text.`);
       placed.push({ h, make: (top, page, col) => {
         const ox = col * COLDX, sx = stemX + ox;
-        const item = { qid: q.id, num: qi + 1, label: q.label || String(qi + 1), page, r: BUB_R, top, h, stem: { x: sx, y: top, lines: stemLines }, choices: [], lane: { x0: col ? COL2_X0 : 11.5, x1: bubX + ox - BUB_R - 0.6 }, uni, look };
+        const item = { qid: q.id, num: qi + 1, label: q.label || String(qi + 1), page, r: MR, top, h, stem: { x: sx, y: top, lines: stemLines }, choices: [], lane: { x0: col ? COL2_X0 : 11.5, x1: bubX + ox - BUB_R - 0.6 }, uni, look };
         if (compact) { item.col = col; item.numX = 29.5 + ox; }
         if (stemImg) { item.stem.img = { x: sx, y: top + stemImg.dy, w: stemImg.w, h: stemImg.h }; item.stem.numY = top + numY; }
         let iy = top + (stemImg ? stemImg.dy + stemImg.h + 0.6 : Math.max(1, stemLines.length) * STEM_LH + 0.6);
@@ -341,7 +365,7 @@ const Layout = (() => {
         if (flat) {
           item.flat = true;
           for (let i = 0; i < nCh; i++) {
-            const rt = top + stemH + Math.floor(i / flat.per) * RH6, bx = bubX + ox + (i % flat.per) * flat.cw;
+            const rt = top + stemH, bx = bubX + ox + flat.xs[i];
             item.choices.push({ label: LETTERS[i], x: bx, y: rt + 3.2, text: { x: bx + (chX - bubX), y: rt + 3.2 + 1.25, lines: flat.lines[i] }, rowTop: rt, rowH: RH6 });
           }
         }
@@ -363,11 +387,18 @@ const Layout = (() => {
       let mcEndC = y;
       for (let g = 0; g < placed.length; g += 10) {
         if (g > 0) newPage('mc');
-        const grp = placed.slice(g, g + 10), half = Math.ceil(grp.length / 2), top0 = y;
+        const grp = placed.slice(g, g + 10), top0 = y;
+        // split point (questions stay in order, first ones left): the shortest tallest column, near the middle
+        let half = Math.ceil(grp.length / 2), bestV = Infinity;
+        if (WIDE) { half = grp.length; bestV = -1; }
+        for (let k = Math.max(1, Math.floor(grp.length / 2) - 2); k <= Math.min(grp.length, Math.ceil(grp.length / 2) + 2); k++) {
+          const a = grp.slice(0, k).reduce((x, m) => x + m.h, 0), b = grp.slice(k).reduce((x, m) => x + m.h, 0), v = Math.max(a, b) + Math.abs(k - grp.length / 2) * 0.01;
+          if (!WIDE && v < bestV) { bestV = v; half = k; }
+        }
         let yl = top0, yr = top0;
         grp.forEach((m, i) => {
           const colI = i < half ? 0 : 1; let t = colI ? yr : yl;
-          if (t + m.h > CONTENT.bottom) L._mcOver = true;
+          if (t + m.h - 2.4 > CONTENT.bottom) L._mcOver = true;
           L.mc.push(m.make(t, page, colI));
           if (colI) yr += m.h; else yl += m.h;
         });
@@ -440,25 +471,44 @@ const Layout = (() => {
     if (compact) {
       // up to five per page; a question with a picture or a long text takes more of the page; leftover room is shared by the boxes
       const PL = lh(10.5), MINBOX = 24, GAP = 3, wTxt = CONTENT.right - stemX, uni = exam.uniText === true && !!UNI;
-      const meas = sas.map((q, qi) => {
+      const measure = (q, qi, picH, minB) => {
         if (q.kind === 'page' && q.img) return { q, qi, page: true };
         const lines = q.prompt && q.prompt.trim() && !q.img ? wrap(doc, q.prompt, wTxt, P_PT, 'normal', uni) : (q.img ? [] : ['']);
-        const pImgs = [q.img, ...(q.imgs || [])].filter(Boolean).map(im => fitBox(im, wTxt, 80));
+        const pImgs = [q.img, ...(q.imgs || [])].filter(Boolean).map(im => fitBox(im, wTxt, picH));
         const promptH = (lines.length ? lines.length * PL : 0) + pImgs.reduce((a, f) => a + f.h + 1.2, 0) + 1.6;
         // boxes with printed rows need room for about 7 mm per writing line
         const LWm = CONTENT.right - stemX - 24;
-        const slots = (q.fill || []).filter(r => r && typeof r.t === 'string').reduce((a, r) => a + Math.max(1, r.t ? wrap(doc, r.t, LWm * 0.7, 9.5, 'bold', uni).length : 1) + Math.max(1, Math.min(4, r.lines | 0 || 1)) - 1, 0);
-        const minBox = Math.max(MINBOX, slots ? 3 + slots * 6.4 : 0);
+        const slots = (q.fill || []).filter(r => r && typeof r.t === 'string').reduce((a, r) => a + Math.max(1, r.t ? wrap(doc, r.t, LWm * 0.7, 9.5, 'bold', uni).length : 1) + (minB <= 10 ? 0 : Math.max(1, Math.min(4, r.lines | 0 || 1)) - 1), 0);
+        const minBox = Math.max(minB, slots ? 3 + slots * (minB <= 10 ? 6.0 : minB <= 12 ? 4.8 : minB < MINBOX ? 5.4 : 6.4) : 0);
         return { q, qi, lines, pImgs, promptH, minBox, need: promptH + minBox + GAP };
+      };
+      // groups of five (a whole-page question stands alone); in each group pictures, then the empty room, shrink until all five fit on the page
+      const meas = []; let run = [];
+      const flush = () => {
+        if (!run.length) return;
+        let pick = null, fits = false;
+        for (const [picH, minB] of [[80, MINBOX], [60, MINBOX], [45, MINBOX], [34, MINBOX], [26, 20], [20, 16], [18, 12], [16, 10]]) {
+          const mm = run.map(([q, qi]) => measure(q, qi, picH, minB));
+          const room = !meas.length && !mcs.length ? CONTENT.bottom - headEnd : CONTENT.bottom - CONTENT.top;
+          pick = mm; if (mm.reduce((a, m) => a + m.need, 0) <= room + 1e-6) { fits = true; break; }
+        }
+        // five cannot fit even with small pictures (a long list question, a full drawing task): that page takes fewer
+        if (!fits && run.length > 1) { const all = run, cut = Math.ceil(all.length / 2); run = all.slice(0, cut); flush(); run = all.slice(cut); flush(); return; }
+        pick.forEach(m => { m.grp = meas.length; }); const gid = meas.length; meas.push(...pick.map(m => Object.assign(m, { gid }))); run = [];
+      };
+      sas.forEach((q, qi) => {
+        if (q.kind === 'page' && q.img) { flush(); meas.push({ q, qi, page: true }); return; }
+        run.push([q, qi]); if (run.length === 5) flush();
       });
+      flush();
       const groups = []; let cur = null, avail0 = 0;
       // when the multiple choice ran onto a second page, the written questions start under it on that page (saves a page)
-      const mcPages = new Set(L.mc.map(m => m.page)).size, shareTop = mcs.length && mcPages > 1 && y + 60 < CONTENT.bottom ? y + 5 : null;
+      const shareTop = null;   // Nov 25 2026: the written questions always start on their own page
       const startPage = (first) => { const share = first && shareTop !== null, top = first && !mcs.length ? headEnd : share ? shareTop : CONTENT.top; cur = { top, avail: CONTENT.bottom - top, used: 0, items: [], first, share }; groups.push(cur); };
       meas.forEach((m, k) => {
         if (m.page) { cur = null; groups.push({ pageItem: m }); return; }
-        if (!cur || cur.items.length >= 5 || cur.used + m.need > cur.avail + 1e-6) {
-          startPage(groups.length === 0);
+        if (!cur || cur.items.length >= 5 || cur.gid !== m.gid) {
+          startPage(groups.length === 0); cur.gid = m.gid;
           if (cur.share && m.need > cur.avail) { groups.pop(); cur = { top: CONTENT.top, avail: CONTENT.bottom - CONTENT.top, used: 0, items: [], first: false }; groups.push(cur); }
         }
         cur.items.push(m); cur.used += m.need;
@@ -494,7 +544,9 @@ const Layout = (() => {
           // a long label wraps (never cut): its last line carries the first writing line
           const LW = box.w - 24;
           const R = F.map(r => { const lbl = r.t ? wrap(doc, r.t, LW * 0.7, 9.5, 'bold', uni) : []; const n = Math.max(1, Math.min(4, r.lines | 0 || 1)); return { r, lbl, n, slots: Math.max(1, lbl.length) + n - 1 }; });
-          const nL = R.reduce((a, x) => a + x.slots, 0);
+          // a crowded page: fewer writing lines per row before the lines get too close to write on (at least about 5.6 mm apart)
+          let nL = R.reduce((a, x) => a + x.slots, 0);
+          while ((box.h - 3) / nL < 5.6) { const x = R.filter(x => x.n > 1).sort((a, b) => b.n - a.n)[0]; if (!x) break; x.n--; x.slots--; nL--; }
           const pitch = Math.min(9.5, (box.h - 3) / nL);
           let ry = box.y + 1.5;
           item.fill = R.map((x, i) => {
@@ -547,9 +599,9 @@ const Layout = (() => {
       L.extra.push({ id: rp.id, page, kind: 'ref', img: { x: CONTENT.left + (CONTENT.right - CONTENT.left - f.w) / 2, y: CONTENT.top, w: f.w, h: f.h } });
     });
     if (L._mcOver) {
-      // smaller type down to about 9 pt; past that the questions flow onto the next page instead
-      if (MS > 0.81) return compute(Object.assign({}, exam, { _mcScale: Math.round((MS - 0.05) * 100) / 100 }));
-      return compute(Object.assign({}, exam, { _mcScale: 1, _mcFlow: true }));
+      // ten per page, no exception (Nov 25 2026): smaller type down to about 7.5 pt, then smaller pictures
+      L.issues.push('Ten multiple choice questions do not fit on one page even with small type and pictures; shorten the longest ones.');
+      L._over = true;
     }
     delete L._mcOver;
     L.pageCount = page;
@@ -836,7 +888,10 @@ const Layout = (() => {
       const T = C.idText;
       doc.setTextColor(30); doc.setFont('helvetica', 'bold'); doc.setFontSize(10);
       doc.text('Student ID', C.idBox.x, T.y + T.h - 2.4);
-      doc.setDrawColor(60); doc.setLineWidth(0.35); doc.rect(T.x, T.y, T.w, T.h, 'S');
+      doc.setDrawColor(60); doc.setLineWidth(0.35);
+      if (C.idCells) C.idCells.forEach(c => doc.rect(c.x, c.y, c.w, c.h, 'S')); else doc.rect(T.x, T.y, T.w, T.h, 'S');
+      doc.setFont('helvetica', 'normal'); doc.setFontSize(8); doc.setTextColor(110);
+      if (C.idCells) doc.text('One digit per box', T.x + T.w + 3, T.y + T.h - 2.6);
       doc.setDrawColor(190); doc.setLineWidth(0.25); doc.line(CONTENT.left, C.end, CONTENT.right, C.end);
       return;
     }
